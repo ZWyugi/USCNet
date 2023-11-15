@@ -87,7 +87,7 @@ def main(args, logger):
 
     #load pretrainmodel
     if args.pretrain_oi != "None":
-        backbone_oi = backbone_oi.load_state_dict(torch.load(args.pretrain_cla))
+        backbone_oi.load_state_dict(torch.load(args.pretrain_oi))
         print("Successfully loaded oi_net")
     if args.pretrain_seg != "None":
         pretrained_dict = torch.load(args.pretrain_seg)

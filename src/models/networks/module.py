@@ -180,10 +180,10 @@ class CAL_Net(nn.Module):
         self.value_conv = nn.Conv3d(value_in_dim, value_in_dim, kernel_size=1)
 
         self.softmax = nn.Softmax(dim=-1)
-        self.gamma = nn.Parameter(torch.zeros(1))
+        # self.gamma = nn.Parameter(torch.zeros(1))
 
         self.avgpool = nn.AdaptiveAvgPool3d(output_size=(1, 1, 1))
-        self.fc = nn.Linear(in_features=value_in_dim, out_features=num_classes, bias=True)
+        self.fc1 = nn.Linear(in_features=value_in_dim, out_features=num_classes, bias=True)
 
     def forward(self, x, y, z):
         # encode
@@ -203,8 +203,9 @@ class CAL_Net(nn.Module):
         att_x = torch.bmm(proj_value, attention.permute(0, 2, 1))
         att_x = att_x.view(batch_size, channels, height, width, depth)
 
-        att_x = self.gamma * att_x + feature_oi
-
+        # att_x = self.gamma * att_x + feature_oi
+        # print('gama\n', self.gamma)
+        att_x = att_x + feature_oi
         self.finalconv = att_x.clone()
 
         # classification head

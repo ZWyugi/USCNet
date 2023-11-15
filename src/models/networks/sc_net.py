@@ -98,7 +98,7 @@ class SC_Net(nn.Module):
         mlp_dim: int = 3072,
         num_heads: int = 8,
         pos_embed: str = "conv",
-        dropout_rate: float = 0.0,
+        dropout_rate: float = 0.2,
         spatial_dims: int = 3,
         deep_supervision=False,
         norm_cfg='BN', activation_cfg='ReLU', weight_std=False
