@@ -183,7 +183,7 @@ class CAL_Net(nn.Module):
         # self.gamma = nn.Parameter(torch.zeros(1))
 
         self.avgpool = nn.AdaptiveAvgPool3d(output_size=(1, 1, 1))
-        self.fc1 = nn.Linear(in_features=value_in_dim, out_features=num_classes, bias=True)
+        self.fc = nn.Linear(in_features=value_in_dim, out_features=num_classes, bias=True)
 
     def forward(self, x, y, z):
         # encode
