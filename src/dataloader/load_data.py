@@ -148,6 +148,11 @@ class MyDataset(Dataset):
         spacing = itkimage.GetSpacing()
         img = sitk.GetArrayFromImage(itkimage)
         mask = sitk.GetArrayFromImage(itkmask)
+        # MASK 膨胀腐蚀操作
+        kernel = ball(5)  # 3D球形核
+        # 应用3D膨胀
+        dilated_mask = dilation(mask, kernel)
+        mask = closing(dilated_mask, kernel)
         resize_factor = spacing / np.array(new_spacing)
         resample_img = zoom(img, resize_factor, order=0)
         resample_mask = zoom(mask, resize_factor, order=0, mode='nearest')
@@ -169,11 +174,11 @@ class MyDataset(Dataset):
             print(e)
             img = resize(img, self.input_size)
             mask = resize(mask, self.input_size, order=0)
-        # MASK 膨胀腐蚀操作
-        kernel = ball(5)  # 3D球形核
-        # 应用3D膨胀
-        dilated_mask = dilation(mask, kernel)
-        closed_mask = closing(dilated_mask, kernel)
+        # # MASK 膨胀腐蚀操作
+        # kernel = ball(5)  # 3D球形核
+        # # 应用3D膨胀
+        # dilated_mask = dilation(mask, kernel)
+        # mask = closing(dilated_mask, kernel)
 
         # 高斯滤波去噪
         img = gaussian_filter(img, sigma=1)
@@ -181,7 +186,7 @@ class MyDataset(Dataset):
         # from scipy.ndimage import median_filter
         # img = median_filter(img, size=3)
 
-        return img, closed_mask
+        return img, mask
 
 
 

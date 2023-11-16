@@ -12,6 +12,7 @@ import os
 import math
 import argparse
 import torch
+
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim.lr_scheduler as lr_scheduler
@@ -168,6 +169,7 @@ class Trainer:
         print(f'train epoch:{self.epoch}/{self.epochs}, Loss:{per_epoch_loss / len(self.train_loader)}, acc:{num_correct / total_step}')
 
 def main(args, logger):
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("can use {} gpus".format(torch.cuda.device_count()))
     print(device)
