@@ -23,7 +23,7 @@ import itertools
 import functools
 import sklearn.metrics
 from sklearn.metrics import accuracy_score
-
+import nibabel as nib
 
 class Logger:
     def __init__(self,mode='w'):
@@ -209,6 +209,25 @@ def main(args, logger):
 
                 if train_cla:
                     original_seg, zoom_seg = generate_patch_mask(img, pred_mask)
+
+
+                    # out_seg = original_seg.to('cpu').numpy()[0][0]
+                    # out_cat = zoom_seg.to('cpu').numpy()[0][0]
+                    # pred_mask_ = pred_mask.to('cpu').numpy()[0][0]
+                    # img_ = img.to('cpu').numpy()[0][0]
+                    # seg_label_ = seg_label.to('cpu').numpy()[0][0]
+                    #
+                    # nifti_image = nib.Nifti1Image(out_seg, affine=None)
+                    # nib.save(nifti_image, os.path.join('./', f'out_seg.nii.gz'))
+                    # nifti_image = nib.Nifti1Image(out_cat, affine=None)
+                    # nib.save(nifti_image, os.path.join('./', f'out_cat.nii.gz'))
+                    # nifti_image = nib.Nifti1Image(pred_mask_, affine=None)
+                    # nib.save(nifti_image, os.path.join('./', f'pred_mask_.nii.gz'))
+                    # nifti_image = nib.Nifti1Image(img_, affine=None)
+                    # nib.save(nifti_image, os.path.join('./', f'img_.nii.gz'))
+                    # nifti_image = nib.Nifti1Image(seg_label_, affine=None)
+                    # nib.save(nifti_image, os.path.join('./', f'seg_label_.nii.gz'))
+
                     cla_out = cla_net(res_encoder_output, zoom_seg, original_seg)
 
                     if use_cam:
@@ -228,6 +247,9 @@ def main(args, logger):
                     res = metrics_seg[k](pred_mask, seg_label)
                     if type(res) == torch.Tensor and res.shape[0] > 0:
                         res = torch.mean(res[~torch.isnan(res)])
+
+                        if res > 0.5:
+                            break
 
                     metrics_seg_values[k].update(res, bs)
 
@@ -465,7 +487,7 @@ if __name__ == '__main__':
     # 将参数字典保存为 JSON 文件
     import time
     now = time.strftime('%y%m%d%H%M', time.localtime())
-    with open(f'training_config_{now}.json', 'w') as fp:
+    with open(f'./configs/training_config_{now}.json', 'w') as fp:
         json.dump(args_dict, fp, indent=4)
 
     print(f"Training configuration saved to training_config_{now}.json")

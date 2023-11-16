@@ -15,12 +15,12 @@ from skimage.transform import resize
 from scipy.ndimage import zoom
 import SimpleITK as sitk
 from scipy.ndimage import zoom
-
 from collections import defaultdict
-
+from skimage.morphology import dilation, ball, closing
+from scipy.ndimage import gaussian_filter
 
 def split_data(data_dir, rate=0.8):
-    with open(os.path.join(data_dir, 'infos.json'), 'r') as f:
+    with open(os.path.join(data_dir, 'infos.json'), 'r', encoding='utf-8') as f:
         infos = json.load(f)
 
     # 创建一个字典，用于按类别存储数据
@@ -86,8 +86,8 @@ class MyDataset(Dataset):
         return img, mask, label
 
     def train_preprocess(self, img, mask):
-        img = self.resample(img)
-        mask = self.resample(mask)
+        img, mask = self.resample(itkimage=img, itkmask=mask)
+        # mask = self.resample(mask)
         # print(img.shape, mask.shape)
         assert img.shape == mask.shape, "img and mask shape not match"
         img, mask = self.crop(img, mask)
@@ -96,8 +96,8 @@ class MyDataset(Dataset):
 
         return img, mask
     def val_preprocess(self, img, mask):
-        img = self.resample(img)
-        mask = self.resample(mask)
+        img, mask = self.resample(img, mask)
+        # mask = self.resample(mask)
         assert img.shape == mask.shape, "img and mask shape not match"
         # img, mask = self.crop(img, mask)
         img = self.normalize(img)
@@ -144,25 +144,14 @@ class MyDataset(Dataset):
 
         return crop_img, crop_mask
 
-    def resample(self, itkimage, new_spacing=[1, 1, 1]):
-        # spacing = itkimage.GetSpacing()
-        img_array = sitk.GetArrayFromImage(itkimage)
-        # resize_factor = spacing / np.array(new_spacing)
-        # new_real_shape = img_array.shape * resize_factor
-        # new_shape = np.round(new_real_shape)
-        # real_resize_factor = new_shape / img_array.shape
-        # new_spacing = spacing / real_resize_factor
-        # img = zoom(img_array, real_resize_factor, mode='nearest')
-        # resampler = sitk.ResampleImageFilter()
-        # originSize = itkimage.GetSize()  # 原来的体素块尺寸
-        # # newSize = np.array(newSize, float)
-        # factor = spacing / new_spacing
-        # resampler.SetReferenceImage(itkimage)  # 需要重新采样的目标图像
-        # resampler.SetOutputSpacing(new_spacing)
-        # resampler.SetTransform(sitk.Transform(3, sitk.sitkIdentity))
-        # resampler.SetInterpolator(resamplemethod)
-        # itkimgResampled = resampler.Execute(itkimage)  # 得到重新采样后的图像
-        return np.array(img_array, dtype=np.float32)
+    def resample(self, itkimage, itkmask, new_spacing=[1, 1, 1]):
+        spacing = itkimage.GetSpacing()
+        img = sitk.GetArrayFromImage(itkimage)
+        mask = sitk.GetArrayFromImage(itkmask)
+        resize_factor = spacing / np.array(new_spacing)
+        resample_img = zoom(img, resize_factor, order=0)
+        resample_mask = zoom(mask, resize_factor, order=0, mode='nearest')
+        return np.array(resample_img, dtype=np.float32), np.array(resample_mask, dtype=np.float32),
 
     def normalize(self, img):
         std = np.std(img)
@@ -173,9 +162,26 @@ class MyDataset(Dataset):
         img = np.transpose(img, (2, 1, 0))
         mask = np.transpose(mask, (2, 1, 0))
         rate = np.array(self.input_size) / np.array(img.shape)
-        img = zoom(img, rate.tolist(), order=0)
-        mask = zoom(mask, rate.tolist(), order=0, mode='nearest')
-        return img, mask
+        try:
+            img = zoom(img, rate.tolist(), order=0)
+            mask = zoom(mask, rate.tolist(), order=0, mode='nearest')
+        except Exception as e:
+            print(e)
+            img = resize(img, self.input_size)
+            mask = resize(mask, self.input_size, order=0)
+        # MASK 膨胀腐蚀操作
+        kernel = ball(5)  # 3D球形核
+        # 应用3D膨胀
+        dilated_mask = dilation(mask, kernel)
+        closed_mask = closing(dilated_mask, kernel)
+
+        # 高斯滤波去噪
+        img = gaussian_filter(img, sigma=1)
+        # 中值滤波去噪
+        # from scipy.ndimage import median_filter
+        # img = median_filter(img, size=3)
+
+        return img, closed_mask
 
 
 
@@ -188,13 +194,15 @@ def my_dataloader(data_dir, infos, batch_size=3, shuffle=True, num_workers=0, in
 # #
 # train_info, test_info = split_data(data_dir, rate=0.8)
 # print(len(train_info), len(test_info))
-# train_dataloader = my_dataloader(data_dir, train_info, input_size=(128, 128, 128))
-# test_dataloader = my_dataloader(data_dir, test_info, input_size=(128, 128, 128))
+# train_dataloader = my_dataloader(data_dir, train_info, input_size=(128, 128, 128), batch_size=1)
+# test_dataloader = my_dataloader(data_dir, test_info, input_size=(128, 128, 128), batch_size=1)
 # for i, (image, mask, label) in enumerate(train_dataloader):
-#     print(i,image.shape, mask.shape, label)
-#     break
-#     print(mask.sum())
-# #
+#     print(image.shape, mask.shape)
+#     nifti_image = nib.Nifti1Image(image.numpy()[0][0], affine=None)
+#     nib.save(nifti_image, os.path.join(data_dir, f'process_img_{i}.nii.gz'))
+#     nifti_image = nib.Nifti1Image(mask.numpy()[0][0], affine=None)
+#     nib.save(nifti_image, os.path.join(data_dir, f'process_mask_{i}.nii.gz'))
 #
+
 # for i, (image, mask, label) in enumerate(test_dataloader):
 #     print(i,  image.shape, mask.shape, label)

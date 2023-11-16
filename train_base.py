@@ -15,85 +15,16 @@ import torch
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim.lr_scheduler as lr_scheduler
-
 from tqdm import tqdm
 import torch
-
 from torch.optim.lr_scheduler import ExponentialLR
 import torch.nn as nn
 from src.dataloader.load_data import split_data, my_dataloader
-
 from torch.nn.parallel import DataParallel
-
-
-
-
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm3d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm3d(out_channels)
-        self.downsample = None
-        if in_channels != out_channels or stride != 1:
-            self.downsample = nn.Sequential(
-                nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm3d(out_channels)
-            )
-
-    def forward(self, x):
-        residual = x
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-        out = self.conv2(out)
-        out = self.bn2(out)
-        if self.downsample:
-            residual = self.downsample(x)
-        out += residual
-        out = self.relu(out)
-        return out
-
-
-# 构建残差网络
-class ResNet(nn.Module):
-    def __init__(self, block, num_blocks, num_classes):
-        super(ResNet, self).__init__()
-        self.in_channels = 64
-        self.conv1 = nn.Conv3d(1, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm3d(64)
-        self.relu = nn.ReLU(inplace=True)
-        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
-        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
-        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
-        self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
-        self.avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
-        self.fc = nn.Linear(512, num_classes)
-        self.softmax = nn.Softmax()
-
-    def _make_layer(self, block, out_channels, num_blocks, stride):
-        layers = []
-        layers.append(block(self.in_channels, out_channels, stride))
-        self.in_channels = out_channels
-        for i in range(1, num_blocks):
-            layers.append(block(out_channels, out_channels))
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.layer4(out)
-        out = self.avg_pool(out)
-        out = out.view(-1, 512)
-        out = self.fc(out)
-        out = self.softmax(out)
-        return out
+from src.models.networks.resnet import generate_model
+import time
+import json
+import torch.nn.functional as F
 
 class Logger:
     def __init__(self,mode='w'):
@@ -119,14 +50,14 @@ class Logger:
 
 
 class Trainer:
-    def __init__(self, model, optimizer, device, train_loader, test_loader, epochs, scheduler, args, summaryWriter):
+    def __init__(self, model, optimizer, device, train_loader, test_loader, scheduler, args, summaryWriter):
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
         self.train_loader = train_loader
         self.test_loader = test_loader
-        self.epochs = epochs
+        self.epochs = args.epochs
         self.epoch = 0
         self.best_acc = 0
         self.args = args
@@ -141,7 +72,6 @@ class Trainer:
             self.train_one_epoch()
             self.num_params = sum([param.nelement() for param in self.model.parameters()])
             self.scheduler.step()
-
             end = time.time()
             print("Epoch: {}, train time: {}".format(epoch, end - start))
             if epoch % 1 == 0:
@@ -149,8 +79,14 @@ class Trainer:
 
     def load_model(self):
         if self.args.MODEL_WEIGHT:
-            # self.model =
-            self.model.load_state_dict(torch.load(self.args.MODEL_WEIGHT)['model_state_dict'])
+
+            model_dict = self.model.state_dict()
+            pretrain = torch.load(self.args.MODEL_WEIGHT)
+            pretrained_dict = {k: v for k, v in pretrain['state_dict'].items() if
+                               k in model_dict and model_dict[k].size() == v.size()}
+            model_dict.update(pretrained_dict)
+            self.model.load_state_dict(model_dict)
+
             print('load model weight success!')
 
     def evaluate(self):
@@ -163,11 +99,12 @@ class Trainer:
                 x = x.to(self.device)
                 label = label.to(self.device)
                 total_step += x.shape[0]
-                logits = self.model(x)
-                loss = self.loss_function(logits, label)
+                pred = self.model(x)[-1]
+                pred = F.softmax(pred, dim=-1)
+                loss = self.loss_function(pred, label)
                 per_epoch_loss += loss.item()
-                pred = logits.argmax(dim=1)
-                per_epoch_num_correct += torch.eq(pred, label).sum().item()
+                pred_class = pred.argmax(dim=1)
+                per_epoch_num_correct += torch.eq(pred_class, label).sum().item()
             test_acc = per_epoch_num_correct / total_step
             print(f'TEST: Epoch:{self.epoch}/{self.epochs}, Loss:{per_epoch_loss/(inx+1)}, acc:{test_acc}')
             self.summaryWriter.add_scalar("Loss/TEST", per_epoch_loss/len(self.test_loader), self.epoch)
@@ -187,7 +124,7 @@ class Trainer:
                 logger.logger.info('save model %d successed......\n'%self.epoch)
 
             if self.best_acc < test_acc:
-                best_acc = test_acc
+                self.best_acc = test_acc
                 # logger.logger.info('best model in %d epoch, train acc: %.3f \n' % (self.epoch, train_acc))
                 # logger.logger.info('best model in %d epoch, validation acc: %.3f \n' % (epoch, val_acc))
                 checkpoint = {
@@ -209,18 +146,21 @@ class Trainer:
         for inx, (x, mask, label) in tqdm(enumerate(self.train_loader), total=len(self.train_loader)):
             x = x.to(self.device)
             label = label.to(self.device)
-            logits = self.model(x)
+            pred = self.model(x)[-1]
+            pred = F.softmax(pred, dim=-1)
+            loss = self.loss_function(pred, label)
+            per_epoch_loss += loss.item()
+            pred_class = pred.argmax(dim=1)
 
-            loss = self.loss_function(logits, label)
+            loss = self.loss_function(pred, label)
             per_epoch_loss += loss.item()
             total_step += x.shape[0]
             # Backward and optimize
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
-            pred = logits.argmax(dim=1)
             # print(f'logits:{logits}, pred:{pred}, label:{label}')
-            num_correct += torch.eq(pred, label).sum().item()
+            num_correct += torch.eq(pred_class, label).sum().item()
             # if inx % 5 == 0:
             # print(f'iters:{inx}/{len(self.train_loader)}, Loss:{loss.item()}, acc:{num_correct/total_step}')
         self.summaryWriter.add_scalar("Loss/TRAIN", per_epoch_loss / len(self.train_loader), self.epoch)
@@ -231,7 +171,8 @@ def main(args, logger):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("can use {} gpus".format(torch.cuda.device_count()))
     print(device)
-    model = ResNet(ResidualBlock, [2, 2, 2, 2], num_classes=args.num_classes)
+    # model = ResNet(ResidualBlock, [2, 2, 2, 2], num_classes=args.num_classes)
+    model = generate_model(model_depth=18, n_classes=args.num_classes)
     # model = models.resnet18(pretrained=True)
     # num_ftrs = model.fc.in_features  # 获取低级特征维度
     # model.fc = nn.Linear(num_ftrs, args.num_classes)  # 替换新的输出层
@@ -258,7 +199,6 @@ def main(args, logger):
                       device,
                       train_loader,
                       val_loader,
-                      args.epochs,
                       scheduler,
                       args,
                       summaryWriter)
@@ -269,16 +209,22 @@ if __name__ == '__main__':
     parser.add_argument('--num_classes', type=int, default=2)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=1)
-    parser.add_argument('--lr', type=float, default=0.01)
+    parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--save_epoch', type=int, default=5)
     parser.add_argument('--log_dir', type=str, default='./Logs')
     parser.add_argument('--save_dir', type=str, default='./models')
     parser.add_argument('--num_workers', type=int, default=0)
-    parser.add_argument('--input_size', type=float, default=(128, 128, 128))
+    parser.add_argument('--input_size', type=str, default="128, 128, 128")
     parser.add_argument('--input_path', type=str, default='/home/wangchangmiao/kidney/data/data')
     parser.add_argument('--MODEL_WEIGHT', type=str, default=None)
 
     opt = parser.parse_args()
+    args_dict = vars(opt)
+    now = time.strftime('%y%m%d%H%M', time.localtime())
+    with open(f'./configs/training_config_{now}.json', 'w') as fp:
+        json.dump(args_dict, fp, indent=4)
+    print(f"Training configuration saved to training_config_{now}.json")
+    print(args_dict)
 
     logger = Logger()
     main(opt, logger)
