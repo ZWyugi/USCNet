@@ -174,7 +174,7 @@ def main(args, logger):
     print("can use {} gpus".format(torch.cuda.device_count()))
     print(device)
     # model = ResNet(ResidualBlock, [2, 2, 2, 2], num_classes=args.num_classes)
-    model = generate_model(model_depth=18, n_classes=args.num_classes)
+    model = generate_model(model_depth=34, n_classes=args.num_classes)
     # model = models.resnet18(pretrained=True)
     # num_ftrs = model.fc.in_features  # 获取低级特征维度
     # model.fc = nn.Linear(num_ftrs, args.num_classes)  # 替换新的输出层
@@ -183,7 +183,7 @@ def main(args, logger):
         model = DataParallel(model)
     model.to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.00001)
     scheduler = ExponentialLR(optimizer, gamma=0.99)
     # data_dir = r'C:\Users\Asus\Desktop\肺腺癌\data\肾结石数据\KdneyStone\202310326结石成分分析龙岗区人民医院李星智'
     # if not os.path.exists(data_dir):
@@ -217,7 +217,7 @@ if __name__ == '__main__':
     parser.add_argument('--save_dir', type=str, default='./models')
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--input_size', type=str, default="128, 128, 128")
-    parser.add_argument('--input_path', type=str, default='/home/wangchangmiao/kidney/data/data')
+    parser.add_argument('--input_path', type=str, default='/home/wangchangmiao/kidney/data/')
     parser.add_argument('--MODEL_WEIGHT', type=str, default=None)
 
     opt = parser.parse_args()
