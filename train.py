@@ -13,9 +13,10 @@ from torch.utils.tensorboard import SummaryWriter
 import sys
 from tqdm import tqdm
 from src.models.networks.module import ResEncoder, CAL_Net
-from src.models.networks.sc_net_ag import SC_Net
+from src.models.networks.resnet import generate_model
+from src.models.networks.sc_net import SC_Net
 import shutil
-from utils import AverageMeter, generate_patch_mask, returnCAM, load_npy_data, set_seed, _init_fn
+from utils import AverageMeter, generate_patch_mask, returnCAM, load_pretrain
 from src.dataloader.load_data import split_data, my_dataloader
 from torch.utils.data import DataLoader
 from torch.nn import DataParallel
@@ -23,7 +24,7 @@ import itertools
 import functools
 import sklearn.metrics
 from sklearn.metrics import accuracy_score
-import nibabel as nib
+
 
 class Logger:
     def __init__(self,mode='w'):
@@ -71,11 +72,20 @@ def main(args, logger):
     img_size = tuple([int(i)// 8 for i in re.findall('\d+',args.input_size)])
     # print("model img_size input:",img_size)
     seg_net = SC_Net(in_channels=512, img_size=img_size)
-    backbone_oi = ResEncoder(depth=7, in_channels=1)
-    backbone_zoom = ResEncoder(depth=4, in_channels=2)
-    backbone_mask = ResEncoder(depth=4, in_channels=1)
-    cla_net = CAL_Net(backbone_mask, backbone_zoom, num_classes=args.num_classes)
+    # ResEncoder_oi = generate_model(34)
+    # ResEncoder_zoom = generate_model(18)
+    # ResEncoder_mask = generate_model(18)
+    backbone_oi = generate_model(34, n_input_channels=1)
+    backbone_zoom = generate_model(18, n_input_channels=2)
+    backbone_mask = generate_model(18, n_input_channels=1)
 
+    backbone_zoom = load_pretrain(args.pretrain_r18, backbone_zoom)
+    backbone_mask = load_pretrain(args.pretrain_r18, backbone_mask)
+
+    cla_net = CAL_Net(backbone_mask, backbone_zoom, num_classes=args.num_classes)
+    seg_net = load_pretrain(args.pretrain_seg, seg_net)
+    cla_net = load_pretrain(args.pretrain_cla, cla_net)
+    backbone_oi = load_pretrain(args.pretrain_r34, backbone_oi)
     #seg_net = DataParallel(seg_net)
     #cla_net = DataParallel(cla_net)
 
@@ -83,26 +93,6 @@ def main(args, logger):
     seg_net.to(device)
     cla_net.to(device)
     backbone_oi.to(device)
-    ##################
-
-    #load pretrainmodel
-    if args.pretrain_oi != "None":
-        backbone_oi.load_state_dict(torch.load(args.pretrain_oi))
-        print("Successfully loaded oi_net")
-    if args.pretrain_seg != "None":
-        pretrained_dict = torch.load(args.pretrain_seg)
-        model_dict = seg_net.state_dict()
-        # 过滤出可以加载的权重
-        pretrained_dict = {k: v for k, v in pretrained_dict.items() if
-                           k in model_dict and model_dict[k].size() == v.size()}
-        model_dict.update(pretrained_dict)
-        seg_net.load_state_dict(model_dict)
-        # seg_net.load_state_dict(torch.load(args.pretrain_seg))
-        print("Successfully loaded seg_net!")
-    if args.pretrain_cla != "None":
-        cla_net.load_state_dict(torch.load(args.pretrain_cla))
-        print("Successfully loaded cla_net!")
-    ######################
 
     if not train_seg:
         for name, param in seg_net.named_parameters():
@@ -123,7 +113,7 @@ def main(args, logger):
         gamma=args.gamma
     )
 
-    #loss
+    # loss
     criterion_seg = monai.losses.DiceLoss()
     criterion_cla = torch.nn.CrossEntropyLoss()
     criterion_cam = monai.losses.DiceLoss()
@@ -136,7 +126,6 @@ def main(args, logger):
 
     metrics_seg.update({k.__class__.__name__: k for k in metrics_seg_list if type(k) != functools.partial})
 
-
     metrics_cla_list = config.get_parsed_content("VALIDATION#metrics#cla")
     metrics_cla = {}
     for k in metrics_cla_list:
@@ -148,22 +137,22 @@ def main(args, logger):
         else:  # class
             metrics_cla[k.__class__.__name__] = k
 
-    #data
+    # data
     train_info, val_info = split_data(args.input_path, rate=0.8)
     train_data_loader = my_dataloader(args.input_path,
-                               train_info,
-                               batch_size=args.batch_size,
-                               shuffle=True,
-                               num_workers=args.num_workers,
-                               input_size=args.input_size,
-                               task=task)
+                                      train_info,
+                                      batch_size=args.batch_size,
+                                      shuffle=True,
+                                      num_workers=args.num_workers,
+                                      input_size=args.input_size,
+                                      task=task)
     test_data_loader = my_dataloader(args.input_path,
-                            val_info,
-                            batch_size=args.batch_size,
-                            shuffle=False,
-                            num_workers=args.num_workers,
-                            input_size=args.input_size,
-                            task=task)
+                                     val_info,
+                                     batch_size=args.batch_size,
+                                     shuffle=False,
+                                     num_workers=args.num_workers,
+                                     input_size=args.input_size,
+                                     task=task)
     #########################
 
     print("Start training")
@@ -173,7 +162,7 @@ def main(args, logger):
     running_loss_seg = AverageMeter()
     running_loss_cla = AverageMeter()
     metrics_seg_values = {k: AverageMeter() for k in metrics_seg}
-    best_metric = {k:{"epoch":0, "value":0} for k in config["VALIDATION"]["save_best_metric"]}
+    best_metric = {k: {"epoch": 0, "value": 0} for k in config["VALIDATION"]["save_best_metric"]}
 
     for epoch in tqdm(range(args.epochs)):
         s_t = time.time()
@@ -202,14 +191,13 @@ def main(args, logger):
             cla_loss = 0
             cam_loss = 0
             if train_seg:
-                res_encoder_output = backbone_oi(img)
+                res_encoder_output = backbone_oi(img)[:-1]
                 pred_mask = seg_net(res_encoder_output)
                 seg_loss += criterion_seg(pred_mask, seg_label)
                 pred_mask = torch.where(pred_mask > 0.5, 1, 0).byte()
 
                 if train_cla:
                     original_seg, zoom_seg = generate_patch_mask(img, pred_mask)
-
 
                     # out_seg = original_seg.to('cpu').numpy()[0][0]
                     # out_cat = zoom_seg.to('cpu').numpy()[0][0]
@@ -233,7 +221,7 @@ def main(args, logger):
                     if use_cam:
                         features = cla_net.finalconv
                         fc_weights = cla_net.fc.weight.data
-                        cams = returnCAM(features, fc_weights, cla_label, size=tuple([int(i*8) for i in img_size]))
+                        cams = returnCAM(features, fc_weights, cla_label, size=tuple([int(i * 8) for i in img_size]))
                         cams = cams.to(device)
                         cam_loss += criterion_cam(cams, seg_label)
 
@@ -255,7 +243,7 @@ def main(args, logger):
 
             else:
                 if train_cla:
-                    res_encoder_output = backbone_oi(img)
+                    res_encoder_output = backbone_oi(img)[:-1]
                     original_seg, zoom_seg = generate_patch_mask(img, seg_label)
                     cla_out = cla_net(res_encoder_output, zoom_seg, original_seg)
                     if use_cam:
@@ -289,7 +277,6 @@ def main(args, logger):
             # if train_cla:
             #     gt.append(cla_label.cpu())
             #     cla_pred.append(F.softmax(cla_out, dim=-1).argmax(1, keepdim=True).cpu())
-
 
         if train_cla:
             gt = torch.cat(gt, dim=0)
@@ -347,7 +334,8 @@ def main(args, logger):
 
             with torch.no_grad():
 
-                for batch_idx, (img, seg_label, cla_label) in tqdm(enumerate(test_data_loader), total=len(test_data_loader)):
+                for batch_idx, (img, seg_label, cla_label) in tqdm(enumerate(test_data_loader),
+                                                                   total=len(test_data_loader)):
                     # if batch_idx > 100:
                     #     break
                     bs, c, h, w, d = img.shape
@@ -359,9 +347,9 @@ def main(args, logger):
                     seg_loss = 0
                     cla_loss = 0
                     if train_seg:
-                        res_encoder_output = backbone_oi(img)
+                        res_encoder_output = backbone_oi(img)[:-1]
                         pred_mask = seg_net(res_encoder_output)
-                        #pred_mask = activation(pred_mask)
+                        # pred_mask = activation(pred_mask)
                         seg_loss += criterion_seg(pred_mask, seg_label)
                         pred_mask = torch.where(pred_mask > 0.5, 1, 0).byte()
 
@@ -388,7 +376,7 @@ def main(args, logger):
                             img = img.to(device)
                             original_seg = original_seg.to(device)
                             zoom_seg = zoom_seg.to(device)
-                            res_encoder_output = backbone_oi(img)
+                            res_encoder_output = backbone_oi(img)[:-1]
                             cla_out = cla_net(res_encoder_output, zoom_seg, original_seg)
                             cla_loss += criterion_cla(cla_out, cla_label)
 
@@ -429,7 +417,8 @@ def main(args, logger):
                 logger.logger.info('%d epoch test classification loss: %.3f \n' % (epoch, running_loss_cla.avg))
                 for k in metrics_seg_values:
                     test_writer.add_scalar("Metrics_seg/" + k, metrics_seg_values[k].avg, epoch)
-                    logger.logger.info('%d epoch Metrics_seg/{}: %.3f \n'.format(k) % (epoch, metrics_seg_values[k].avg))
+                    logger.logger.info(
+                        '%d epoch Metrics_seg/{}: %.3f \n'.format(k) % (epoch, metrics_seg_values[k].avg))
                 for k in metrics_cla_values:
                     test_writer.add_scalar("Metrics_cla/" + k, metrics_cla_values[k], epoch)
                     logger.logger.info('%d epoch Metrics_cla/{}: %.3f \n'.format(k) % (epoch, metrics_cla_values[k]))
@@ -438,14 +427,15 @@ def main(args, logger):
                     if k in metrics_seg_values and metrics_seg_values[k].avg > best_metric[k]["value"]:
                         print('{} increased ({:.6f} --> {:.6f}).'.format(k, best_metric[k]["value"],
                                                                          metrics_seg_values[k].avg))
-                        torch.save(backbone_oi.state_dict(), os.path.join(model_dir, "max_{}-backbone_oi.pkl".format(k)))
+                        torch.save(backbone_oi.state_dict(),os.path.join(model_dir, "max_{}-backbone_oi.pkl".format(k)))
                         torch.save(cla_net.state_dict(), os.path.join(model_dir, "max_{}-cla_net.pkl".format(k)))
                         torch.save(seg_net.state_dict(), os.path.join(model_dir, "max_{}-seg_net.pkl".format(k)))
                         best_metric[k]["value"] = metrics_seg_values[k].avg
                         best_metric[k]["epoch"] = epoch
                     if k in metrics_cla_values and metrics_cla_values[k] > best_metric[k]["value"]:
-                        print('{} increased ({:.6f} --> {:.6f}).'.format(k, best_metric[k]["value"], metrics_cla_values[k]))
-                        torch.save(backbone_oi.state_dict(), os.path.join(model_dir, "max_{}-backbone_oi.pkl".format(k)))
+                        print('{} increased ({:.6f} --> {:.6f}).'.format(k, best_metric[k]["value"],
+                                                                         metrics_cla_values[k]))
+                        torch.save(backbone_oi.state_dict(),os.path.join(model_dir, "max_{}-backbone_oi.pkl".format(k)))
                         torch.save(cla_net.state_dict(), os.path.join(model_dir, "max_{}-cla_net.pkl".format(k)))
                         torch.save(seg_net.state_dict(), os.path.join(model_dir, "max_{}-seg_net.pkl".format(k)))
                         best_metric[k]["value"] = metrics_cla_values[k]
@@ -458,11 +448,12 @@ def main(args, logger):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config_file', type=str, default='configs/config.yaml')
-    parser.add_argument('--task', type=list, default=[0, 1])
+    parser.add_argument('--task', type=str, default=[0, 1])
     parser.add_argument('--use_cam', type=int, default=None)
-    parser.add_argument('--pretrain_seg', type=str, default='None')
-    parser.add_argument('--pretrain_cla', type=str, default='None')
-    parser.add_argument('--pretrain_oi', type=str, default='None')
+    parser.add_argument('--pretrain_seg', type=str, default=None)
+    parser.add_argument('--pretrain_cla', type=str, default=None)
+    parser.add_argument('--pretrain_r18', type=str, default=None)
+    parser.add_argument('--pretrain_r34', type=str, default=None)
     parser.add_argument('--input_path', type=str, default='/home/KidneyData/data')
     parser.add_argument('--output_path', type=str, default='./results')
     parser.add_argument('--input_size', type=str, default=(128, 128, 128))
@@ -471,9 +462,9 @@ if __name__ == '__main__':
     parser.add_argument('--save_epoch', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--lr', type=float, default=0.01)
+    parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--betas', type=tuple, default=(0.9, 0.999))
-    parser.add_argument('--weight_decay', type=float, default=0.01)
+    parser.add_argument('--weight_decay', type=float, default=0.00001)
     parser.add_argument('--milestones', type=list, default=[100])
     parser.add_argument('--gamma', type=float, default=0.1)
     parser.add_argument('--loss_weights', type=list, default=[0.2, 0, 0.8])
@@ -485,7 +476,6 @@ if __name__ == '__main__':
     args_dict = vars(opt)
 
     # 将参数字典保存为 JSON 文件
-    import time
     now = time.strftime('%y%m%d%H%M', time.localtime())
     with open(f'./configs/training_config_{now}.json', 'w') as fp:
         json.dump(args_dict, fp, indent=4)
@@ -494,5 +484,3 @@ if __name__ == '__main__':
 
     logger = Logger()
     main(opt, logger)
-
-

@@ -192,7 +192,7 @@ class CAL_Net(nn.Module):
         feature_mask = self.mask_encode(z)[-1]
 
         # decode
-        batch_size, channels, height, width, depth = feature_oi.size()
+        batch_size, channels, depth, height, width  = feature_oi.size()
 
         proj_query = self.query_conv(feature_mask).view(batch_size, -1, width * height * depth).permute(0, 2, 1)  # B X CX(N)
         proj_key = self.key_conv(feature_zoom).view(batch_size, -1, width * height * depth)  # B X C x (*W*H)
@@ -201,7 +201,7 @@ class CAL_Net(nn.Module):
         proj_value = self.value_conv(feature_oi).view(batch_size, -1, width * height * depth)  # B X C X N
 
         att_x = torch.bmm(proj_value, attention.permute(0, 2, 1))
-        att_x = att_x.view(batch_size, channels, height, width, depth)
+        att_x = att_x.view(batch_size, channels, depth, height, width)
 
         # att_x = self.gamma * att_x + feature_oi
         # print('gama\n', self.gamma)

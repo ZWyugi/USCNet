@@ -12,7 +12,6 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 import json
 from skimage.transform import resize
-from scipy.ndimage import zoom
 import SimpleITK as sitk
 from scipy.ndimage import zoom
 from collections import defaultdict
@@ -145,18 +144,18 @@ class MyDataset(Dataset):
         return crop_img, crop_mask
 
     def resample(self, itkimage, itkmask, new_spacing=[1, 1, 1]):
-        spacing = itkimage.GetSpacing()
+        # spacing = itkimage.GetSpacing()
         img = sitk.GetArrayFromImage(itkimage)
         mask = sitk.GetArrayFromImage(itkmask)
-        # MASK 膨胀腐蚀操作
-        kernel = ball(5)  # 3D球形核
-        # 应用3D膨胀
-        dilated_mask = dilation(mask, kernel)
-        mask = closing(dilated_mask, kernel)
-        resize_factor = spacing / np.array(new_spacing)
-        resample_img = zoom(img, resize_factor, order=0)
-        resample_mask = zoom(mask, resize_factor, order=0, mode='nearest')
-        return np.array(resample_img, dtype=np.float32), np.array(resample_mask, dtype=np.float32),
+        # # MASK 膨胀腐蚀操作
+        # kernel = ball(5)  # 3D球形核
+        # # 应用3D膨胀
+        # dilated_mask = dilation(mask, kernel)
+        # mask = closing(dilated_mask, kernel)
+        # resize_factor = spacing / np.array(new_spacing)
+        # resample_img = zoom(img, resize_factor, order=0)
+        # resample_mask = zoom(mask, resize_factor, order=0, mode='nearest')
+        return np.array(img, dtype=np.float32), np.array(mask, dtype=np.float32)
 
     def normalize(self, img):
         std = np.std(img)
@@ -164,8 +163,8 @@ class MyDataset(Dataset):
         return (img - avg + std) / (std * 2)
 
     def resize(self, img, mask):
-        img = np.transpose(img, (2, 1, 0))
-        mask = np.transpose(mask, (2, 1, 0))
+        # img = np.transpose(img, (2, 1, 0))
+        # mask = np.transpose(mask, (2, 1, 0))
         rate = np.array(self.input_size) / np.array(img.shape)
         try:
             img = zoom(img, rate.tolist(), order=0)
@@ -190,7 +189,7 @@ class MyDataset(Dataset):
 
 
 
-def my_dataloader(data_dir, infos, batch_size=3, shuffle=True, num_workers=0, input_size=(128, 128, 128), task=[0, 1]):
+def my_dataloader(data_dir, infos, batch_size=1, shuffle=True, num_workers=0, input_size=(64, 128, 256), task=[0, 1]):
     dataset = MyDataset(data_dir, infos, input_size=input_size, task=task)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
     return dataloader
@@ -199,14 +198,14 @@ def my_dataloader(data_dir, infos, batch_size=3, shuffle=True, num_workers=0, in
 # #
 # train_info, test_info = split_data(data_dir, rate=0.8)
 # print(len(train_info), len(test_info))
-# train_dataloader = my_dataloader(data_dir, train_info, input_size=(128, 128, 128), batch_size=1)
-# test_dataloader = my_dataloader(data_dir, test_info, input_size=(128, 128, 128), batch_size=1)
+# train_dataloader = my_dataloader(data_dir, train_info, input_size=(64, 128, 256), batch_size=1)
+# test_dataloader = my_dataloader(data_dir, test_info, input_size=(64, 128, 256), batch_size=1)
 # for i, (image, mask, label) in enumerate(train_dataloader):
 #     print(image.shape, mask.shape)
-#     nifti_image = nib.Nifti1Image(image.numpy()[0][0], affine=None)
-#     nib.save(nifti_image, os.path.join(data_dir, f'process_img_{i}.nii.gz'))
-#     nifti_image = nib.Nifti1Image(mask.numpy()[0][0], affine=None)
-#     nib.save(nifti_image, os.path.join(data_dir, f'process_mask_{i}.nii.gz'))
+    # nifti_image = nib.Nifti1Image(image.numpy()[0][0], affine=None)
+    # nib.save(nifti_image, os.path.join(data_dir, f'process_img_{i}.nii.gz'))
+    # nifti_image = nib.Nifti1Image(mask.numpy()[0][0], affine=None)
+    # nib.save(nifti_image, os.path.join(data_dir, f'process_mask_{i}.nii.gz'))
 #
 
 # for i, (image, mask, label) in enumerate(test_dataloader):

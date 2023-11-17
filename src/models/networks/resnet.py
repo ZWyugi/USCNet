@@ -198,6 +198,7 @@ class ResNet(nn.Module):
     def forward(self, x):
 
         out = []
+        out.append(x)
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
@@ -243,14 +244,16 @@ if __name__ == '__main__':
     model = generate_model(18)
 
     model_dict = model.state_dict()
-    pretrain = torch.load(r"C:\my\download\r3d18_K_200ep.pth", map_location='cpu')
+    pretrain = torch.load(r"C:\Users\Asus\Desktop\肺腺癌\models\r3d18_K_200ep.pth", map_location='cpu')
     pretrained_dict = {k: v for k, v in pretrain['state_dict'].items() if
                        k in model_dict and model_dict[k].size() == v.size()}
     model_dict.update(pretrained_dict)
     model.load_state_dict(model_dict)
     model.train()
-    img = torch.randn(1, 1, 64, 64, 32)
+    img = torch.randn(1, 1, 144, 256, 256)
     print(img.shape)
     out = model(img)
+    for i in out:
+        print(i.shape)
     print(F.softmax(out[-1], dim=-1))
     print(F.softmax(out[-1], dim=-1).argmax(1, keepdim=True))

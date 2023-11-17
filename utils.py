@@ -1,6 +1,4 @@
 import torch
-from torchvision.transforms import Resize
-import scipy
 import numpy as np
 import os
 import random
@@ -94,3 +92,17 @@ def returnCAM(feature_conv, weight_softmax, idx, size=(256, 256, 256)):
     out = torch.cat(cams, dim=0)
 
     return out
+
+def load_pretrain(path, model):
+    if path:
+        if os.path.exists(path):
+            print("loading pretrained model from {}".format(path))
+            pretrained_dict = torch.load(path)
+            model_dict = model.state_dict()
+            pretrained_dict = {k: v for k, v in pretrained_dict.items() if
+                               k in model_dict and model_dict[k].size() == v.size()}
+            model_dict.update(pretrained_dict)
+            model.load_state_dict(model_dict)
+        else:
+            print('pretrained model path not exists!')
+    return model
