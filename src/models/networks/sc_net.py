@@ -156,6 +156,12 @@ class SC_Net(nn.Module):
         self.stage1_de = ResBlock(128, 64, norm_cfg, activation_cfg, weight_std=weight_std)
         self.stage0_de = ResBlock(64, 64, norm_cfg, activation_cfg, weight_std=weight_std)
 
+        # resencoder output upsample
+        self.transposeconv_resout_up0 = nn.ConvTranspose3d(512, 512, kernel_size=(2, 2, 2), stride=(2, 2, 2), bias=False)
+        self.transposeconv_resout_up1 = nn.ConvTranspose3d(256, 256, kernel_size=(2, 2, 2), stride=(2, 2, 2), bias=False)
+        self.transposeconv_resout_up2 = nn.ConvTranspose3d(128, 128, kernel_size=(2, 2, 2), stride=(2, 2, 2), bias=False)
+        self.transposeconv_resout_up3 = nn.ConvTranspose3d(64, 64, kernel_size=(2, 2, 2), stride=(2, 2, 2), bias=False)
+
         # skip cnn
         self.cnn_skip3 = Conv3dBlock(512, 512, norm_cfg, activation_cfg, kernel_size=3, stride=1, padding=1, weight_std=weight_std)
         self.cnn_skip2_1 = Conv3dBlock(512, 512, norm_cfg, activation_cfg, kernel_size=3, stride=1, padding=1, weight_std=weight_std)
@@ -206,7 +212,8 @@ class SC_Net(nn.Module):
         ag1_out = torch.mul(skip4, ag1_alpha2)
         #######
 
-        out1 = torch.cat([ag1_out, res_encoder_output[-1]], dim=1)
+        resout_up0 = self.transposeconv_resout_up0(res_encoder_output[-1])
+        out1 = torch.cat([ag1_out, resout_up0], dim=1)
         out1 = self.stage4_de(out1)
         out1 = self.transposeconv_stage3(out1)
         skip2_1 = self.cnn_skip2_1(self.transposeconv_skip2_1(self.proj_feat(hidden_states_out[-7])))
@@ -221,7 +228,8 @@ class SC_Net(nn.Module):
         ag2_out = torch.mul(out1, ag2_alpha2)
         ######
 
-        out2 = torch.cat([ag2_out, res_encoder_output[-2]], dim=1)
+        resout_up1 = self.transposeconv_resout_up1(res_encoder_output[-2])
+        out2 = torch.cat([ag2_out, resout_up1], dim=1)
         out2 = self.stage3_de(out2)
         out2 = self.transposeconv_stage2(out2)
         skip1_1 = self.cnn_skip1_1(self.transposeconv_skip1_1(self.proj_feat(hidden_states_out[-10])))
@@ -237,7 +245,8 @@ class SC_Net(nn.Module):
         ag3_out = torch.mul(out2, ag3_alpha2)
         ######
 
-        out3 = torch.cat([ag3_out, res_encoder_output[-3]], dim=1)
+        resout_up2 = self.transposeconv_resout_up2(res_encoder_output[-3])
+        out3 = torch.cat([ag3_out, resout_up2], dim=1)
         out3 = self.stage2_de(out3)
         out3 = self.transposeconv_stage1(out3)
         skip0_1 = self.cnn_skip0_1(self.transposeconv_skip0_1(self.proj_feat(hidden_states_out[-13])))
@@ -254,7 +263,8 @@ class SC_Net(nn.Module):
         ag4_out = torch.mul(out3, ag4_alpha2)
         ######
 
-        out4 = torch.cat([ag4_out, res_encoder_output[-4]], dim=1)
+        resout_up3 = self.transposeconv_resout_up3(res_encoder_output[-4])
+        out4 = torch.cat([ag4_out, resout_up3], dim=1)
         out4 = self.stage1_de(out4)
         out4 = self.transposeconv_stage0(out4)
         cbr_skip = self.cbr2(self.cbr1(res_encoder_output[-5]))

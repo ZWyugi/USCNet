@@ -188,8 +188,8 @@ class CAL_Net(nn.Module):
     def forward(self, x, y, z):
         # encode
         feature_oi = x[-1]
-        feature_zoom = self.zoom_encode(y)[-1]
-        feature_mask = self.mask_encode(z)[-1]
+        feature_zoom = self.zoom_encode(y)[-2]
+        feature_mask = self.mask_encode(z)[-2]
 
         # decode
         batch_size, channels, depth, height, width  = feature_oi.size()

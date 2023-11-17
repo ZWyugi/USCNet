@@ -69,7 +69,9 @@ def main(args, logger):
     test_writer = SummaryWriter(os.path.join(summary_dir, 'test'), flush_secs=2)
 
     #model
-    img_size = tuple([int(i)// 8 for i in re.findall('\d+',args.input_size)])
+    [d, h, w] = [int(i) for i in re.findall('\d+',args.input_size)]
+    img_size = (d//16, h//32, w//32)
+    # img_size = tuple([int(i)// 8 for i in re.findall('\d+',args.input_size)])
     # print("model img_size input:",img_size)
     seg_net = SC_Net(in_channels=512, img_size=img_size)
     # ResEncoder_oi = generate_model(34)
@@ -90,6 +92,10 @@ def main(args, logger):
     #cla_net = DataParallel(cla_net)
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.device_count() > 1:
+        seg_net = DataParallel(seg_net)
+        cla_net = DataParallel(cla_net)
+        backbone_oi = DataParallel(backbone_oi)
     seg_net.to(device)
     cla_net.to(device)
     backbone_oi.to(device)
@@ -182,7 +188,7 @@ def main(args, logger):
         for batch_idx, (img, seg_label, cla_label) in tqdm(enumerate(train_data_loader), total=len(train_data_loader)):
             # if batch_idx > 100:
             #     break
-            bs, c, h, w, d = img.shape
+            bs, c, d, w, h = img.shape
             img = img.to(device)
             seg_label = seg_label.to(device)
             cla_label = cla_label.to(device)
@@ -221,7 +227,7 @@ def main(args, logger):
                     if use_cam:
                         features = cla_net.finalconv
                         fc_weights = cla_net.fc.weight.data
-                        cams = returnCAM(features, fc_weights, cla_label, size=tuple([int(i * 8) for i in img_size]))
+                        cams = returnCAM(features, fc_weights, cla_label, size=tuple([d, h, w]))
                         cams = cams.to(device)
                         cam_loss += criterion_cam(cams, seg_label)
 
@@ -338,7 +344,7 @@ def main(args, logger):
                                                                    total=len(test_data_loader)):
                     # if batch_idx > 100:
                     #     break
-                    bs, c, h, w, d = img.shape
+                    bs, c, d, w, h = img.shape
                     img = img.to(device)
                     seg_label = seg_label.to(device)
                     if train_cla:
