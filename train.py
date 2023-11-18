@@ -369,7 +369,7 @@ def main(args, logger):
                             gt.append(cla_label.cpu())
                             cla_pred.append(F.softmax(cla_out, dim=-1).argmax(1, keepdim=True).cpu())
 
-                        seg_label = seg_label.byte()
+                        # seg_label = seg_label.byte()
                         for k in metrics_seg:
                             res = metrics_seg[k](pred_mask, seg_label)
                             if type(res) == torch.Tensor and res.shape[0] > 0:
