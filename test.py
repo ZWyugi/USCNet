@@ -17,10 +17,10 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 import sys
 from tqdm import tqdm
-from src.models.networks.module import ResEncoder, CAL_Net
-from src.models.networks.sc_net_ag import SC_Net
+from src.models.networks.resnet import generate_model
+from src.models.networks.sc_net import SC_Net
 import shutil
-from utils import AverageMeter, generate_patch_mask, returnCAM, load_npy_data, set_seed, _init_fn
+from utils import AverageMeter, generate_patch_mask, returnCAM, load_pretrain
 from src.dataloader.load_data import split_data, my_dataloader
 from torch.utils.data import DataLoader
 from torch.nn import DataParallel
@@ -69,48 +69,40 @@ def main(args, logger):
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(summary_dir, exist_ok=True)
 
+    train_writer = SummaryWriter(os.path.join(summary_dir, 'train'), flush_secs=2)
+    test_writer = SummaryWriter(os.path.join(summary_dir, 'test'), flush_secs=2)
+
     #model
-    img_size = tuple([int(i)// 8 for i in re.findall('\d+',args.input_size)])
+    [d, h, w] = [int(i) for i in re.findall('\d+',args.input_size)]
+    img_size = (d//16, h//32, w//32)
+    # img_size = tuple([int(i)// 8 for i in re.findall('\d+',args.input_size)])
     # print("model img_size input:",img_size)
     seg_net = SC_Net(in_channels=512, img_size=img_size)
-    backbone_oi = ResEncoder(depth=7, in_channels=1)
-    backbone_zoom = ResEncoder(depth=4, in_channels=2)
-    backbone_mask = ResEncoder(depth=4, in_channels=1)
-    cla_net = CAL_Net(backbone_mask, backbone_zoom, num_classes=args.num_classes)
+    # ResEncoder_oi = generate_model(34)
+    # ResEncoder_zoom = generate_model(18)
+    # ResEncoder_mask = generate_model(18)
+    backbone_oi = generate_model(34, n_input_channels=1)
+    backbone_zoom = generate_model(18, n_input_channels=2)
+    backbone_mask = generate_model(18, n_input_channels=1)
 
+    backbone_zoom = load_pretrain(args.pretrain_r18, backbone_zoom)
+    backbone_mask = load_pretrain(args.pretrain_r18, backbone_mask)
+
+    cla_net = CAL_Net(backbone_mask, backbone_zoom, num_classes=args.num_classes)
+    seg_net = load_pretrain(args.pretrain_seg, seg_net)
+    cla_net = load_pretrain(args.pretrain_cla, cla_net)
+    backbone_oi = load_pretrain(args.pretrain_r34, backbone_oi)
     #seg_net = DataParallel(seg_net)
     #cla_net = DataParallel(cla_net)
 
-    device = torch.device('cpu')
-    print(device)
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.device_count() > 1:
+        seg_net = DataParallel(seg_net)
+        cla_net = DataParallel(cla_net)
+        backbone_oi = DataParallel(backbone_oi)
     seg_net.to(device)
     cla_net.to(device)
     backbone_oi.to(device)
-    ##################
-
-    #load pretrainmodel
-    if args.pretrain_oi != "None":
-        backbone_oi.load_state_dict(torch.load(args.pretrain_oi, map_location='cpu'))
-        print("Successfully loaded oi_net")
-    if args.pretrain_seg != "None":
-        pretrained_dict = torch.load(args.pretrain_seg, map_location='cpu')
-        model_dict = seg_net.state_dict()
-        # 过滤出可以加载的权重
-        pretrained_dict = {k: v for k, v in pretrained_dict.items() if
-                           k in model_dict and model_dict[k].size() == v.size()}
-        model_dict.update(pretrained_dict)
-        seg_net.load_state_dict(model_dict)
-        # seg_net.load_state_dict(torch.load(args.pretrain_seg))
-        print("Successfully loaded seg_net!")
-    if args.pretrain_cla != "None":
-        pretrained_dict = torch.load(args.pretrain_cla, map_location='cpu')
-        model_dict = cla_net.state_dict()
-        pretrained_dict = {k: v for k, v in pretrained_dict.items() if
-                           k in model_dict and model_dict[k].size() == v.size()}
-        model_dict.update(pretrained_dict)
-        cla_net.load_state_dict(model_dict)
-        print("Successfully loaded cla_net!")
-    ######################
 
     if not train_seg:
         for name, param in seg_net.named_parameters():
@@ -119,15 +111,31 @@ def main(args, logger):
         for name, param in cla_net.named_parameters():
             param.requires_grad = False
 
-    #loss
+    optimizer = torch.optim.Adam(
+        params=itertools.chain(seg_net.parameters(), cla_net.parameters()),
+        lr=args.lr,
+        betas=args.betas,
+        weight_decay=args.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer=optimizer,
+        milestones=args.milestones,
+        gamma=args.gamma
+    )
+
+    # loss
     criterion_seg = monai.losses.DiceLoss()
     criterion_cla = torch.nn.CrossEntropyLoss()
+    criterion_cam = monai.losses.DiceLoss()
     criterion_weight = args.loss_weights
     ############
 
     metrics_seg_list = config.get_parsed_content("VALIDATION#metrics#seg")
+
     metrics_seg = {k.func.__name__: k for k in metrics_seg_list if type(k) == functools.partial}
+
     metrics_seg.update({k.__class__.__name__: k for k in metrics_seg_list if type(k) != functools.partial})
+
     metrics_cla_list = config.get_parsed_content("VALIDATION#metrics#cla")
     metrics_cla = {}
     for k in metrics_cla_list:
@@ -139,35 +147,24 @@ def main(args, logger):
         else:  # class
             metrics_cla[k.__class__.__name__] = k
 
-    #data
+    # data
     train_info, val_info = split_data(args.input_path, rate=0.8)
     train_data_loader = my_dataloader(args.input_path,
-                               train_info,
-                               batch_size=args.batch_size,
-                               shuffle=True,
-                               num_workers=args.num_workers,
-                               input_size=args.input_size,
-                               task=task)
+                                      train_info,
+                                      batch_size=args.batch_size,
+                                      shuffle=True,
+                                      num_workers=args.num_workers,
+                                      input_size=args.input_size,
+                                      task=task)
     test_data_loader = my_dataloader(args.input_path,
-                            val_info,
-                            batch_size=args.batch_size,
-                            shuffle=True,
-                            num_workers=args.num_workers,
-                            input_size=args.input_size,
-                            task=task)
+                                     val_info,
+                                     batch_size=args.batch_size,
+                                     shuffle=False,
+                                     num_workers=args.num_workers,
+                                     input_size=args.input_size,
+                                     task=task)
     #########################
-    running_loss = AverageMeter()
-    running_loss_seg = AverageMeter()
-    running_loss_cla = AverageMeter()
-    metrics_seg_values = {k: AverageMeter() for k in metrics_seg}
-    best_metric = {k:{"epoch":0, "value":0} for k in config["VALIDATION"]["save_best_metric"]}
 
-    s_t = time.time()
-    running_loss.reset()
-    running_loss_seg.reset()
-    running_loss_cla.reset()
-    for k in metrics_seg_values:
-        metrics_seg_values[k].reset()
 
     gt = []
     cla_pred = []
@@ -269,11 +266,12 @@ def main(args, logger):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config_file', type=str, default='configs/config.yaml')
-    parser.add_argument('--task', type=list, default=[0, 1])
+    parser.add_argument('--task', type=str, default=[0, 1])
     parser.add_argument('--use_cam', type=int, default=None)
-    parser.add_argument('--pretrain_seg', type=str, default='None')
-    parser.add_argument('--pretrain_cla', type=str, default='None')
-    parser.add_argument('--pretrain_oi', type=str, default='None')
+    parser.add_argument('--pretrain_seg', type=str, default=None)
+    parser.add_argument('--pretrain_cla', type=str, default=None)
+    parser.add_argument('--pretrain_r18', type=str, default=None)
+    parser.add_argument('--pretrain_r34', type=str, default=None)
     parser.add_argument('--input_path', type=str, default='/home/KidneyData/data')
     parser.add_argument('--output_path', type=str, default='./results')
     parser.add_argument('--input_size', type=str, default=(128, 128, 128))
@@ -281,10 +279,10 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--save_epoch', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--device', type=str, default='cpu')
-    parser.add_argument('--lr', type=float, default=0.01)
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--betas', type=tuple, default=(0.9, 0.999))
-    parser.add_argument('--weight_decay', type=float, default=0.01)
+    parser.add_argument('--weight_decay', type=float, default=0.00001)
     parser.add_argument('--milestones', type=list, default=[100])
     parser.add_argument('--gamma', type=float, default=0.1)
     parser.add_argument('--loss_weights', type=list, default=[0.2, 0, 0.8])

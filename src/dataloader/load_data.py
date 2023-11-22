@@ -63,6 +63,7 @@ class MyDataset(Dataset):
 
         self.ids = [i['id'] for i in infos]
         self.phase = phase
+        self.labels = torch.FloatTensor(self.labels)
 
     def __len__(self):
         return len(self.ids)
@@ -81,6 +82,8 @@ class MyDataset(Dataset):
 
         img = torch.tensor(img, dtype=torch.float32).unsqueeze(0)
         mask = torch.tensor(mask, dtype=torch.uint8).unsqueeze(0)
+        label = torch.tensor(label).unsqueeze(0)
+
 
         return img, mask, label
 
@@ -194,19 +197,18 @@ def my_dataloader(data_dir, infos, batch_size=1, shuffle=True, num_workers=0, in
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
     return dataloader
 
-# data_dir = r'C:\Users\Asus\Desktop\data'
-# #
-# train_info, test_info = split_data(data_dir, rate=0.8)
-# print(len(train_info), len(test_info))
-# train_dataloader = my_dataloader(data_dir, train_info, input_size=(64, 128, 256), batch_size=1)
-# test_dataloader = my_dataloader(data_dir, test_info, input_size=(64, 128, 256), batch_size=1)
-# for i, (image, mask, label) in enumerate(train_dataloader):
-#     print(image.shape, mask.shape)
-    # nifti_image = nib.Nifti1Image(image.numpy()[0][0], affine=None)
-    # nib.save(nifti_image, os.path.join(data_dir, f'process_img_{i}.nii.gz'))
-    # nifti_image = nib.Nifti1Image(mask.numpy()[0][0], affine=None)
-    # nib.save(nifti_image, os.path.join(data_dir, f'process_mask_{i}.nii.gz'))
-#
+if __name__ == '__main__':
+    data_dir = r'C:\Users\Asus\Desktop\data'
+    train_info, test_info = split_data(data_dir, rate=0.8)
+    train_dataloader = my_dataloader(data_dir, train_info, input_size=(64, 128, 256), batch_size=1)
+    test_dataloader = my_dataloader(data_dir, test_info, input_size=(64, 128, 256), batch_size=1)
+    for i, (image, mask, label) in enumerate(train_dataloader):
+        print(image.shape, mask.shape, label.shape)
+        # nifti_image = nib.Nifti1Image(image.numpy()[0][0], affine=None)
+        # nib.save(nifti_image, os.path.join(data_dir, f'process_img_{i}.nii.gz'))
+        # nifti_image = nib.Nifti1Image(mask.numpy()[0][0], affine=None)
+        # nib.save(nifti_image, os.path.join(data_dir, f'process_mask_{i}.nii.gz'))
+    #
 
-# for i, (image, mask, label) in enumerate(test_dataloader):
-#     print(i,  image.shape, mask.shape, label)
+    # for i, (image, mask, label) in enumerate(test_dataloader):
+    #     print(i,  image.shape, mask.shape, label)

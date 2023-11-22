@@ -179,7 +179,8 @@ class SC_Net(nn.Module):
 
     def forward(self, res_encoder_output):
         transencoder_output, hidden_states_out = self.vit(res_encoder_output[-1])
-        skip3 = self.transposeconv_skip3(self.proj_feat(transencoder_output))
+        transout = self.proj_feat(transencoder_output)
+        skip3 = self.transposeconv_skip3(transout)
         skip2 = self.cnn_skip2(self.transposeconv_skip2(self.proj_feat(hidden_states_out[-4])))
 
         #ag1
@@ -240,7 +241,7 @@ class SC_Net(nn.Module):
         out4 = self.cls_conv(out4)
         out_final = self.sigmoid(out4)
 
-        return out_final
+        return out_final, transout
 
 
 

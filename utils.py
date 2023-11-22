@@ -4,31 +4,24 @@ import os
 import random
 from skimage.transform import resize
 
-def load_npy_data(data_dir):
-    datanp = []  # images
-    truenp = []  # labels
-    for file in os.listdir(data_dir):
-        data = np.load(os.path.join(data_dir, file), allow_pickle=True)
-        #         data[0][0] = resize(data[0][0], (224,224,224))
-        #if (split == 'train'):
-           # data_sug = transform.rotate(data[0][0], 60)  # 旋转60度，不改变大小
-           # data_sug2 = exposure.exposure.adjust_gamma(data[0][0], gamma=0.5)  # 变亮
-           # datanp.append(data_sug)
-           # truenp.append(data[0][1])
-           # datanp.append(data_sug2)
-           # truenp.append(data[0][1])
-        datanp.append(data[0][0])
-        truenp.append(data[0][1])
-    datanp = np.array(datanp)
-    # numpy.array可使用 shape。list不能使用shape。可以使用np.array(list A)进行转换。
-    # 不能随意加维度
-    datanp = np.expand_dims(datanp, axis=4)  # 加维度,from(1256,256,128)to(256,256,128,1),according the cnn tabel.png
-    datanp = datanp.transpose(0, 4, 1, 2, 3)
-    truenp = np.array(truenp).reshape(-1, 4)
-    print(datanp.shape, truenp.shape)
-    print(np.min(datanp), np.max(datanp), np.mean(datanp), np.median(datanp))
-    return datanp, truenp
 
+def calculate_accuracy(outputs, targets):
+    with torch.no_grad():
+        batch_size = targets.size(0)
+
+        _, pred = outputs.topk(1, 1, largest=True, sorted=True)
+        pred = pred.t()
+        correct = pred.eq(targets.view(1, -1))
+        n_correct_elems = correct.float().sum().item()
+
+        return n_correct_elems / batch_size
+
+def calculate_acc_sigmoid(outputs, targets):
+    batch_size = targets.size(0)
+    pred = torch.round(outputs)
+    correct = (pred == targets).float()
+    n_correct_elems = correct.sum().item()
+    return n_correct_elems / batch_size
 def set_seed(seed):
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -67,6 +60,23 @@ class AverageMeter(object):
         self.count += n
         self.avg = self.sum / self.count
 
+class AverageMeter2(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
 
 def generate_patch_mask(img, pred_mask):
     oi_seg = torch.mul(img, pred_mask)

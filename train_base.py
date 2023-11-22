@@ -26,7 +26,8 @@ from src.models.networks.resnet import generate_model
 import time
 import json
 import torch.nn.functional as F
-
+from utils import AverageMeter2 as AverageMeter
+from utils import calculate_acc_sigmoid
 class Logger:
     def __init__(self,mode='w'):
         # 第一步，创建一个logger
@@ -63,27 +64,67 @@ class Trainer:
         self.best_acc = 0
         self.args = args
         self.load_model()
-        self.loss_function = torch.nn.CrossEntropyLoss()
+        self.loss_function = torch.nn.BCELoss()
         self.summaryWriter = summaryWriter
 
     def __call__(self):
-        for epoch in tqdm(range(self.epochs)):
-            start = time.time()
-            self.epoch = epoch+1
-            self.train_one_epoch()
-            self.num_params = sum([param.nelement() for param in self.model.parameters()])
-            self.scheduler.step()
-            end = time.time()
-            print("Epoch: {}, train time: {}".format(epoch, end - start))
-            if epoch % 1 == 0:
-                self.evaluate()
+        if self.args.phase == 'train':
+            for epoch in tqdm(range(self.epochs)):
+                start = time.time()
+                self.epoch = epoch+1
+                self.train_one_epoch()
+                self.num_params = sum([param.nelement() for param in self.model.parameters()])
+                self.scheduler.step()
+                end = time.time()
+                print("Epoch: {}, train time: {}".format(epoch, end - start))
+                if epoch % 1 == 0:
+                    self.evaluate()
+        else:
+            self.model.eval()
+            batch_time = AverageMeter()
+            data_time = AverageMeter()
+            losses = AverageMeter()
+            accuracies = AverageMeter()
+            end_time = time.time()
+            with torch.no_grad():
+                for inx, (x, mask, label) in tqdm(enumerate(self.test_loader), total=len(self.test_loader)):
+                    data_time.update(time.time() - end_time)
+                    x = x.to(self.device)
+                    label = label.to(self.device)
+                    out = self.model(x)[-1]
+                    pred = torch.sigmoid(out)
+                    print('out:{}, sigmoid out:{}, label:{}'.format(out, pred, label))
+                    acc = calculate_acc_sigmoid(pred, label)
+                    loss = self.loss_function(pred, label)
+                    losses.update(loss.item(), x.size(0))
+                    accuracies.update(acc, x.size(0))
+                    batch_time.update(time.time() - end_time)
+                    end_time = time.time()
+                    print('Epoch: [{0}][{1}/{2}]\t'
+                          'Time {batch_time.val:.3f} ({batch_time.avg:.3f})t'
+                          'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                          'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                          'Acc {acc.val:.3f} ({acc.avg:.3f})'
+                          '\nout:{out}-pred:{pred}-label:{label}'.format(
+                            self.epoch,
+                            inx + 1,
+                            len(self.test_loader),
+                            batch_time=batch_time,
+                            data_time=data_time,
+                            loss=losses,
+                            acc=accuracies,
+                            out=out.item(),pred=pred.item(), label=label.item()))
 
     def load_model(self):
         if self.args.MODEL_WEIGHT:
 
             model_dict = self.model.state_dict()
             pretrain = torch.load(self.args.MODEL_WEIGHT)
-            pretrained_dict = {k: v for k, v in pretrain['state_dict'].items() if
+            if 'model_state_dict' in pretrain.keys():
+                state_dict = 'model_state_dict'
+            elif 'state_dict' in pretrain.keys():
+                state_dict = 'state_dict'
+            pretrained_dict = {k: v for k, v in pretrain[state_dict].items() if
                                k in model_dict and model_dict[k].size() == v.size()}
             model_dict.update(pretrained_dict)
             self.model.load_state_dict(model_dict)
@@ -92,24 +133,42 @@ class Trainer:
 
     def evaluate(self):
         self.model.eval()
-        total_step = 0
-        per_epoch_loss = 0
-        per_epoch_num_correct = 0
+
+        batch_time = AverageMeter()
+        data_time = AverageMeter()
+        losses = AverageMeter()
+        accuracies = AverageMeter()
+        end_time = time.time()
+
         with torch.no_grad():
             for inx, (x, mask, label) in tqdm(enumerate(self.test_loader), total=len(self.test_loader)):
+                data_time.update(time.time() - end_time)
                 x = x.to(self.device)
                 label = label.to(self.device)
-                total_step += x.shape[0]
-                pred = self.model(x)[-1]
-                pred = F.softmax(pred, dim=-1)
+                out = self.model(x)[-1]
+                pred = torch.sigmoid(out)
+                acc = calculate_acc_sigmoid(pred, label)
                 loss = self.loss_function(pred, label)
-                per_epoch_loss += loss.item()
-                pred_class = pred.argmax(dim=1)
-                per_epoch_num_correct += torch.eq(pred_class, label).sum().item()
-            test_acc = per_epoch_num_correct / total_step
-            print(f'TEST: Epoch:{self.epoch}/{self.epochs}, Loss:{per_epoch_loss/(inx+1)}, acc:{test_acc}')
-            self.summaryWriter.add_scalar("Loss/TEST", per_epoch_loss/len(self.test_loader), self.epoch)
-            self.summaryWriter.add_scalar("acc/TEST", test_acc, self.epoch)
+                losses.update(loss.item(), x.size(0))
+                accuracies.update(acc, x.size(0))
+                batch_time.update(time.time() - end_time)
+                end_time = time.time()
+
+                print('Epoch: [{0}][{1}/{2}]\t'
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                      'Acc {acc.val:.3f} ({acc.avg:.3f})'.format(
+                    self.epoch,
+                    inx + 1,
+                    len(self.test_loader),
+                    batch_time=batch_time,
+                    data_time=data_time,
+                    loss=losses,
+                    acc=accuracies))
+
+            self.summaryWriter.add_scalar("Loss/TEST", losses.avg, self.epoch)
+            self.summaryWriter.add_scalar("acc/TEST", accuracies.avg, self.epoch)
 
 
             if self.epoch % self.args.save_epoch == 0:
@@ -117,17 +176,15 @@ class Trainer:
                     'model_state_dict': self.model.state_dict(),  # *模型参数
                     'optimizer_state_dict': self.optimizer.state_dict(),  # *优化器参数
                     'scheduler_state_dict': self.scheduler.state_dict(),  # *scheduler
-                    'best_val_score': per_epoch_num_correct / total_step,
+                    'best_val_score': accuracies.avg,
                     'num_params': self.num_params,
                     'epoch': self.epoch
                 }
                 torch.save(checkpoint, os.path.join(self.args.save_dir, 'checkpoint-%d.pth' % self.epoch))
                 logger.logger.info('save model %d successed......\n'%self.epoch)
 
-            if self.best_acc < test_acc:
-                self.best_acc = test_acc
-                # logger.logger.info('best model in %d epoch, train acc: %.3f \n' % (self.epoch, train_acc))
-                # logger.logger.info('best model in %d epoch, validation acc: %.3f \n' % (epoch, val_acc))
+            if self.best_acc < accuracies.avg:
+                self.best_acc = accuracies.avg
                 checkpoint = {
                     'model_state_dict': self.model.state_dict(),  # *模型参数
                     'optimizer_state_dict': self.optimizer.state_dict(),  # *优化器参数
@@ -137,65 +194,77 @@ class Trainer:
                     'epoch': self.epoch
                 }
                 torch.save(checkpoint, os.path.join(self.args.save_dir, 'best_checkpoint.pth'))
-                logger.logger.info('save best model  successed......\n')
+                logger.logger.info('save best model successed......\n')
 
     def train_one_epoch(self):
-        per_epoch_loss = 0
-        total_step = 0
-        num_correct = 0
+        batch_time = AverageMeter()
+        data_time = AverageMeter()
+        losses = AverageMeter()
+        accuracies = AverageMeter()
         self.model.train()
+        end_time = time.time()
         for inx, (x, mask, label) in tqdm(enumerate(self.train_loader), total=len(self.train_loader)):
+            data_time.update(time.time() - end_time)
             x = x.to(self.device)
             label = label.to(self.device)
-            pred = self.model(x)[-1]
-            pred = F.softmax(pred, dim=-1)
+            out = self.model(x)[-1]
+            pred = torch.sigmoid(out)
+            # print(out)
             loss = self.loss_function(pred, label)
-            per_epoch_loss += loss.item()
-            pred_class = pred.argmax(dim=1)
+            acc = calculate_acc_sigmoid(pred, label)
 
-            loss = self.loss_function(pred, label)
-            per_epoch_loss += loss.item()
-            total_step += x.shape[0]
-            # Backward and optimize
+            losses.update(loss.item(), x.size(0))
+            accuracies.update(acc, x.size(0))
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
-            # print(f'logits:{logits}, pred:{pred}, label:{label}')
-            num_correct += torch.eq(pred_class, label).sum().item()
-            # if inx % 5 == 0:
-            # print(f'iters:{inx}/{len(self.train_loader)}, Loss:{loss.item()}, acc:{num_correct/total_step}')
-        self.summaryWriter.add_scalar("Loss/TRAIN", per_epoch_loss / len(self.train_loader), self.epoch)
-        self.summaryWriter.add_scalar("acc/TRAIN", num_correct/total_step, self.epoch)
-        print(f'train epoch:{self.epoch}/{self.epochs}, Loss:{per_epoch_loss / len(self.train_loader)}, acc:{num_correct / total_step}')
+            batch_time.update(time.time() - end_time)
+            end_time = time.time()
+            print('Epoch: [{0}][{1}/{2}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Acc {acc.val:.3f} ({acc.avg:.3f})'.format(self.epoch,
+                                                             inx + 1,
+                                                             len(self.train_loader),
+                                                             batch_time=batch_time,
+                                                             data_time=data_time,
+                                                             loss=losses,
+                                                             acc=accuracies))
+        self.summaryWriter.add_scalar("Loss/TRAIN", losses.avg, self.epoch)
+        self.summaryWriter.add_scalar("acc/TRAIN", accuracies.avg, self.epoch)
+        self.summaryWriter.add_scalar("lr", self.args.lr, self.epoch)
+        # print(f'train epoch:{self.epoch}/{self.epochs}, Loss:{per_epoch_loss / len(self.train_loader)}, acc:{num_correct / total_step}')
 
-def main(args, logger):
+def makedirs(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
+    return path
+
+def main(args, logger, path):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("can use {} gpus".format(torch.cuda.device_count()))
     print(device)
-    # model = ResNet(ResidualBlock, [2, 2, 2, 2], num_classes=args.num_classes)
-    model = generate_model(model_depth=34, n_classes=args.num_classes)
-    # model = models.resnet18(pretrained=True)
-    # num_ftrs = model.fc.in_features  # 获取低级特征维度
-    # model.fc = nn.Linear(num_ftrs, args.num_classes)  # 替换新的输出层
+    model = generate_model(model_depth=args.rd, n_classes=args.num_classes)
 
     if torch.cuda.device_count() > 1:
         model = DataParallel(model)
     model.to(device)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.00001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.0001, betas=(0.9, 0.99))
     scheduler = ExponentialLR(optimizer, gamma=0.99)
-    # data_dir = r'C:\Users\Asus\Desktop\肺腺癌\data\肾结石数据\KdneyStone\202310326结石成分分析龙岗区人民医院李星智'
-    # if not os.path.exists(data_dir):
-    #     data_dir = '/home/wangchangmiao/kidney/data/data'
     data_dir = args.input_path
     train_infos, val_infos = split_data(data_dir)
     train_loader = my_dataloader(data_dir, train_infos, batch_size=args.batch_size, input_size=args.input_size)
     val_loader = my_dataloader(data_dir, val_infos, batch_size=args.batch_size, input_size=args.input_size)
-    logger.logger.info('start training......\n')
-    summaryWriter = SummaryWriter(log_dir=args.log_dir)
-    # train_writer = SummaryWriter(os.path.join(summary_dir, 'train'), flush_secs=2)
-    # test_writer = SummaryWriter(os.path.join(summary_dir, 'test'), flush_secs=2)
+    summaryWriter = None
+    if args.phase == 'train':
+        logger.logger.info('start training......\n')
+        log_path = makedirs(os.path.join(path, 'logs'))
+        model_path = makedirs(os.path.join(path, 'models'))
+        args.log_dir = log_path
+        args.save_dir = model_path
+        summaryWriter = SummaryWriter(log_dir=args.log_dir)
     trainer = Trainer(model,
                       optimizer,
                       device,
@@ -206,27 +275,30 @@ def main(args, logger):
                       summaryWriter)
     trainer()
 
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--num_classes', type=int, default=2)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--rd', type=int, default=50)
     parser.add_argument('--save_epoch', type=int, default=5)
-    parser.add_argument('--log_dir', type=str, default='./Logs')
-    parser.add_argument('--save_dir', type=str, default='./models')
     parser.add_argument('--num_workers', type=int, default=0)
-    parser.add_argument('--input_size', type=str, default="128, 128, 128")
+    parser.add_argument('--input_size', type=str, default="144, 256, 256")
     parser.add_argument('--input_path', type=str, default='/home/wangchangmiao/kidney/data/')
     parser.add_argument('--MODEL_WEIGHT', type=str, default=None)
-
+    parser.add_argument('--phase', type=str, default='train')
     opt = parser.parse_args()
     args_dict = vars(opt)
     now = time.strftime('%y%m%d%H%M', time.localtime())
-    with open(f'./configs/training_config_{now}.json', 'w') as fp:
+    if not os.path.exists(f'./results/{now}'):
+        os.makedirs(f'./results/{now}')
+    path = f'./results/{now}'
+    with open(os.path.join(path, 'train_config.json'), 'w') as fp:
         json.dump(args_dict, fp, indent=4)
     print(f"Training configuration saved to training_config_{now}.json")
     print(args_dict)
 
     logger = Logger()
-    main(opt, logger)
+    main(opt, logger, path)

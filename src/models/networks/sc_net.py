@@ -200,6 +200,7 @@ class SC_Net(nn.Module):
 
     def forward(self, res_encoder_output):
         transencoder_output, hidden_states_out = self.vit(res_encoder_output[-1])
+        # self.transencoder_output = self.proj_feat(transencoder_output)
         skip4 = self.transposeconv_skip4(self.proj_feat(transencoder_output))
         skip3 = self.cnn_skip3(self.transposeconv_skip3(self.proj_feat(hidden_states_out[-4])))
 

@@ -14,11 +14,10 @@ import sys
 from tqdm import tqdm
 from src.models.networks.module import ResEncoder, CAL_Net
 from src.models.networks.resnet import generate_model
-from src.models.networks.sc_net import SC_Net
+from src.models.networks.sc_net_ag import SC_Net
 import shutil
 from utils import AverageMeter, generate_patch_mask, returnCAM, load_pretrain
 from src.dataloader.load_data import split_data, my_dataloader
-from torch.utils.data import DataLoader
 from torch.nn import DataParallel
 import itertools
 import functools
@@ -70,23 +69,25 @@ def main(args, logger):
 
     #model
     [d, h, w] = [int(i) for i in re.findall('\d+',args.input_size)]
-    img_size = (d//16, h//32, w//32)
+    img_size = (d//8, h//8, w//8)
     # img_size = tuple([int(i)// 8 for i in re.findall('\d+',args.input_size)])
     # print("model img_size input:",img_size)
     seg_net = SC_Net(in_channels=512, img_size=img_size)
     # ResEncoder_oi = generate_model(34)
     # ResEncoder_zoom = generate_model(18)
     # ResEncoder_mask = generate_model(18)
-    backbone_oi = generate_model(34, n_input_channels=1)
-    backbone_zoom = generate_model(18, n_input_channels=2)
-    backbone_mask = generate_model(18, n_input_channels=1)
+    backbone_oi = ResEncoder(depth=10)
+    if train_cla:
+        # backbone_zoom = generate_model(18, n_input_channels=2)
+        # backbone_mask = generate_model(18, n_input_channels=1)
+        backbone_mask = ResEncoder(depth=10)
+        # backbone_zoom = load_pretrain(args.pretrain_r18, backbone_zoom)
+        backbone_mask = load_pretrain(args.pretrain_r18, backbone_mask)
+        # cla_net = CAL_Net(backbone_mask, backbone_zoom, num_classes=args.num_classes)
+        cla_net = CAL_Net(backbone_mask, num_classes=args.num_classes)
+        cla_net = load_pretrain(args.pretrain_cla, cla_net)
 
-    backbone_zoom = load_pretrain(args.pretrain_r18, backbone_zoom)
-    backbone_mask = load_pretrain(args.pretrain_r18, backbone_mask)
-
-    cla_net = CAL_Net(backbone_mask, backbone_zoom, num_classes=args.num_classes)
     seg_net = load_pretrain(args.pretrain_seg, seg_net)
-    cla_net = load_pretrain(args.pretrain_cla, cla_net)
     backbone_oi = load_pretrain(args.pretrain_r34, backbone_oi)
     #seg_net = DataParallel(seg_net)
     #cla_net = DataParallel(cla_net)
@@ -94,25 +95,35 @@ def main(args, logger):
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     if torch.cuda.device_count() > 1:
         seg_net = DataParallel(seg_net)
-        cla_net = DataParallel(cla_net)
+        if train_cla:
+            cla_net = DataParallel(cla_net)
         backbone_oi = DataParallel(backbone_oi)
     seg_net.to(device)
-    cla_net.to(device)
+    if train_cla:
+        cla_net.to(device)
     backbone_oi.to(device)
 
-    if not train_seg:
-        for name, param in seg_net.named_parameters():
-            param.requires_grad = False
-    if not train_cla:
-        for name, param in cla_net.named_parameters():
-            param.requires_grad = False
-
-    optimizer = torch.optim.Adam(
-        params=itertools.chain(seg_net.parameters(), cla_net.parameters()),
-        lr=args.lr,
-        betas=args.betas,
-        weight_decay=args.weight_decay
-    )
+    # if not train_seg:
+    #     for name, param in seg_net.named_parameters():
+    #         param.requires_grad = False
+    # if train_cla:
+    #     if not train_cla:
+    #         for name, param in cla_net.named_parameters():
+    #             param.requires_grad = False
+    if train_cla:
+        optimizer = torch.optim.Adam(
+            params=itertools.chain(seg_net.parameters(), cla_net.parameters()),
+            lr=args.lr,
+            betas=args.betas,
+            weight_decay=args.weight_decay
+        )
+    else:
+        optimizer = torch.optim.Adam(
+            params=itertools.chain(seg_net.parameters()),
+            lr=args.lr,
+            betas=args.betas,
+            weight_decay=args.weight_decay
+        )
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer=optimizer,
         milestones=args.milestones,
@@ -173,7 +184,8 @@ def main(args, logger):
     for epoch in tqdm(range(args.epochs)):
         s_t = time.time()
         seg_net.train()
-        cla_net.train()
+        if train_cla:
+            cla_net.train()
         backbone_oi.train()
 
         running_loss.reset()
@@ -191,38 +203,22 @@ def main(args, logger):
             bs, c, d, w, h = img.shape
             img = img.to(device)
             seg_label = seg_label.to(device)
-            cla_label = cla_label.to(device)
+            if train_cla:
+                cla_label = cla_label.to(device)
 
             seg_loss = 0
             cla_loss = 0
             cam_loss = 0
+            res_encoder_output = backbone_oi(img)
             if train_seg:
-                res_encoder_output = backbone_oi(img)[:-1]
-                pred_mask = seg_net(res_encoder_output)
+                pred_mask, transout = seg_net(res_encoder_output)
                 seg_loss += criterion_seg(pred_mask, seg_label)
                 pred_mask = torch.where(pred_mask > 0.5, 1, 0).byte()
 
                 if train_cla:
+
                     original_seg, zoom_seg = generate_patch_mask(img, pred_mask)
-
-                    # out_seg = original_seg.to('cpu').numpy()[0][0]
-                    # out_cat = zoom_seg.to('cpu').numpy()[0][0]
-                    # pred_mask_ = pred_mask.to('cpu').numpy()[0][0]
-                    # img_ = img.to('cpu').numpy()[0][0]
-                    # seg_label_ = seg_label.to('cpu').numpy()[0][0]
-                    #
-                    # nifti_image = nib.Nifti1Image(out_seg, affine=None)
-                    # nib.save(nifti_image, os.path.join('./', f'out_seg.nii.gz'))
-                    # nifti_image = nib.Nifti1Image(out_cat, affine=None)
-                    # nib.save(nifti_image, os.path.join('./', f'out_cat.nii.gz'))
-                    # nifti_image = nib.Nifti1Image(pred_mask_, affine=None)
-                    # nib.save(nifti_image, os.path.join('./', f'pred_mask_.nii.gz'))
-                    # nifti_image = nib.Nifti1Image(img_, affine=None)
-                    # nib.save(nifti_image, os.path.join('./', f'img_.nii.gz'))
-                    # nifti_image = nib.Nifti1Image(seg_label_, affine=None)
-                    # nib.save(nifti_image, os.path.join('./', f'seg_label_.nii.gz'))
-
-                    cla_out = cla_net(res_encoder_output, zoom_seg, original_seg)
+                    cla_out = cla_net(res_encoder_output[-1], transout, original_seg)
 
                     if use_cam:
                         features = cla_net.finalconv
@@ -249,9 +245,10 @@ def main(args, logger):
 
             else:
                 if train_cla:
-                    res_encoder_output = backbone_oi(img)[:-1]
+                    res_encoder_output = backbone_oi(img)
                     original_seg, zoom_seg = generate_patch_mask(img, seg_label)
-                    cla_out = cla_net(res_encoder_output, zoom_seg, original_seg)
+                    # cla_out = cla_net(res_encoder_output, zoom_seg, original_seg)
+                    cla_out = cla_net(res_encoder_output[-1], transout, original_seg)
                     if use_cam:
                         features = cla_net.finalconv
                         fc_weights = cla_net.fc.weight.data
@@ -317,18 +314,20 @@ def main(args, logger):
                 logger.logger.info('%d epoch Metrics_cla/{}: %.3f \n'.format(k) % (epoch, metrics_cla_values[k]))
         logger.logger.info('%d epoch train time: %.3f \n' % (epoch, time.time() - s_t))
 
-        if epoch % args.save_epoch == 0:
+        if (epoch+1) % args.save_epoch == 0:
             torch.save(backbone_oi.state_dict(), os.path.join(model_dir, "backbone_oi_params_epo-{}.pkl".format(epoch)))
             torch.save(seg_net.state_dict(), os.path.join(model_dir, "seg_net_params_epo-{}.pkl".format(epoch)))
-            torch.save(cla_net.state_dict(), os.path.join(model_dir, "cla_net_params_epo-{}.pkl".format(epoch)))
+            if train_cla:
+                torch.save(cla_net.state_dict(), os.path.join(model_dir, "cla_net_params_epo-{}.pkl".format(epoch)))
 
-        if epoch % 5 == 0:
+        if (epoch+1) % 5 == 0:
             print("Start testing...")
             logger.logger.info('Start testing......\n')
             s_t = time.time()
             backbone_oi.eval()
             seg_net.eval()
-            cla_net.eval()
+            if train_cla:
+                cla_net.eval()
             running_loss.reset()
             running_loss_seg.reset()
             running_loss_cla.reset()
@@ -353,8 +352,8 @@ def main(args, logger):
                     seg_loss = 0
                     cla_loss = 0
                     if train_seg:
-                        res_encoder_output = backbone_oi(img)[:-1]
-                        pred_mask = seg_net(res_encoder_output)
+                        res_encoder_output = backbone_oi(img)
+                        pred_mask, transout = seg_net(res_encoder_output)
                         # pred_mask = activation(pred_mask)
                         seg_loss += criterion_seg(pred_mask, seg_label)
                         pred_mask = torch.where(pred_mask > 0.5, 1, 0).byte()
@@ -362,8 +361,9 @@ def main(args, logger):
                         if train_cla:
                             original_seg, zoom_seg = generate_patch_mask(img, pred_mask)
                             original_seg = original_seg.to(device)
-                            zoom_seg = zoom_seg.to(device)
-                            cla_out = cla_net(res_encoder_output, zoom_seg, original_seg)
+                            # zoom_seg = zoom_seg.to(device)
+                            # cla_out = cla_net(transout, zoom_seg, original_seg)
+                            cla_out = cla_net(res_encoder_output[-1], transout, original_seg)
                             cla_loss += criterion_cla(cla_out, cla_label)
 
                             gt.append(cla_label.cpu())
@@ -382,8 +382,9 @@ def main(args, logger):
                             img = img.to(device)
                             original_seg = original_seg.to(device)
                             zoom_seg = zoom_seg.to(device)
-                            res_encoder_output = backbone_oi(img)[:-1]
-                            cla_out = cla_net(res_encoder_output, zoom_seg, original_seg)
+                            res_encoder_output = backbone_oi(img)
+                            # cla_out = cla_net(res_encoder_output, zoom_seg, original_seg)
+                            cla_out = cla_net(res_encoder_output[-1], transout, original_seg)
                             cla_loss += criterion_cla(cla_out, cla_label)
 
                             gt.append(cla_label.cpu())
@@ -434,7 +435,8 @@ def main(args, logger):
                         print('{} increased ({:.6f} --> {:.6f}).'.format(k, best_metric[k]["value"],
                                                                          metrics_seg_values[k].avg))
                         torch.save(backbone_oi.state_dict(),os.path.join(model_dir, "max_{}-backbone_oi.pkl".format(k)))
-                        torch.save(cla_net.state_dict(), os.path.join(model_dir, "max_{}-cla_net.pkl".format(k)))
+                        if train_cla:
+                            torch.save(cla_net.state_dict(), os.path.join(model_dir, "max_{}-cla_net.pkl".format(k)))
                         torch.save(seg_net.state_dict(), os.path.join(model_dir, "max_{}-seg_net.pkl".format(k)))
                         best_metric[k]["value"] = metrics_seg_values[k].avg
                         best_metric[k]["epoch"] = epoch
@@ -442,7 +444,8 @@ def main(args, logger):
                         print('{} increased ({:.6f} --> {:.6f}).'.format(k, best_metric[k]["value"],
                                                                          metrics_cla_values[k]))
                         torch.save(backbone_oi.state_dict(),os.path.join(model_dir, "max_{}-backbone_oi.pkl".format(k)))
-                        torch.save(cla_net.state_dict(), os.path.join(model_dir, "max_{}-cla_net.pkl".format(k)))
+                        if train_cla:
+                            torch.save(cla_net.state_dict(), os.path.join(model_dir, "max_{}-cla_net.pkl".format(k)))
                         torch.save(seg_net.state_dict(), os.path.join(model_dir, "max_{}-seg_net.pkl".format(k)))
                         best_metric[k]["value"] = metrics_cla_values[k]
                         best_metric[k]["epoch"] = epoch

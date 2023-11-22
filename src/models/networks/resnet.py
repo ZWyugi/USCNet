@@ -149,7 +149,7 @@ class ResNet(nn.Module):
                                        stride=2)
 
         self.avgpool = nn.AdaptiveAvgPool3d((1, 1, 1))
-        self.fc = nn.Linear(block_inplanes[3] * block.expansion, n_classes)
+        self.fc = nn.Linear(block_inplanes[3] * block.expansion, n_classes-1)
 
         for m in self.modules():
             if isinstance(m, nn.Conv3d):
@@ -241,19 +241,26 @@ def generate_model(model_depth, **kwargs):
     return model
 
 if __name__ == '__main__':
-    model = generate_model(18)
+    model = generate_model(50)
+    loss_function = torch.nn.BCELoss()
 
     model_dict = model.state_dict()
-    pretrain = torch.load(r"C:\Users\Asus\Desktop\肺腺癌\models\r3d18_K_200ep.pth", map_location='cpu')
+    pretrain = torch.load(r"C:\Users\Asus\Desktop\KidneyStone\models\r3d18_K_200ep.pth", map_location='cpu')
     pretrained_dict = {k: v for k, v in pretrain['state_dict'].items() if
                        k in model_dict and model_dict[k].size() == v.size()}
     model_dict.update(pretrained_dict)
     model.load_state_dict(model_dict)
     model.train()
-    img = torch.randn(1, 1, 144, 256, 256)
-    print(img.shape)
-    out = model(img)
-    for i in out:
-        print(i.shape)
-    print(F.softmax(out[-1], dim=-1))
-    print(F.softmax(out[-1], dim=-1).argmax(1, keepdim=True))
+    img = torch.randn(2, 1, 32, 32, 32)
+    out = model(img)[-1]
+    pred = torch.sigmoid(out)
+    # print(out.shape, out)
+    # print(pred.item())
+    from utils import calculate_acc_sigmoid
+
+    print(calculate_acc_sigmoid(pred, torch.tensor([[0.], [1.]])))
+    # print(loss_function(pred, torch.tensor([[0.]])).item())
+    # print(loss_function(pred, torch.tensor([[1.]])).item())
+    pred = torch.round(pred)
+    print(pred)
+    # print(F.softmax(out[-1], dim=-1).argmax(1, keepdim=True))

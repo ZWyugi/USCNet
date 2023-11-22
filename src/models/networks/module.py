@@ -76,6 +76,7 @@ class ResBlock(nn.Module):
 class ResEncoder(nn.Module):
 
     arch_settings = {
+        10: (ResBlock, (3, 3, 3)),
         7: (ResBlock, (2, 2, 2)),
         4: (ResBlock, (1, 1, 1))
     }
@@ -157,16 +158,19 @@ class ResEncoder(nn.Module):
 
 
 class CAL_Net(nn.Module):
-    def __init__(self, backbone_mask, backbone_zoom, num_classes=2):
+    def __init__(self, backbone_mask, num_classes=2):
         super().__init__()
         #self.oi_encode = backbone_oi
         self.mask_encode = backbone_mask
-        self.zoom_encode = backbone_zoom
+        # self.zoom_encode = backbone_zoom
         #self.feature_oi = None
+        in_dim = 1536
+        self.conv1 = nn.Conv3d(in_dim,  512, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm3d(512)
+        self.relu = nn.ReLU()
 
-        in_dim = 512
-        self.query_conv = nn.Conv3d(in_dim, in_dim // 8, kernel_size=1)
-        self.key_conv = nn.Conv3d(in_dim, in_dim // 8, kernel_size=1)
+        # self.query_conv = nn.Conv3d(in_dim, in_dim // 8, kernel_size=1)
+        # self.key_conv = nn.Conv3d(in_dim, in_dim // 8, kernel_size=1)
 
         # if backbone_oi.model_type == "ResNet":
         #     value_in_dim = 512
@@ -185,31 +189,33 @@ class CAL_Net(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool3d(output_size=(1, 1, 1))
         self.fc = nn.Linear(in_features=value_in_dim, out_features=num_classes, bias=True)
 
+        self.transconv = nn.ConvTranspose3d(768, 512, kernel_size=(2, 2, 2), stride=(2, 2, 2), bias=False)
+
     def forward(self, x, y, z):
         # encode
-        feature_oi = x[-1]
-        feature_zoom = self.zoom_encode(y)[-2]
-        feature_mask = self.mask_encode(z)[-2]
-
+        feature_re = x
+        feature_tf = self.transconv(y)
+        # feature_zoom = self.zoom_encode(y)[-2]
+        feature_mask = self.mask_encode(z)[-1]
+        features = torch.cat([feature_re, feature_tf, feature_mask], dim=1)
+        features = self.conv1(features)
+        features = self.bn1(features)
+        features = self.relu(features)
         # decode
-        batch_size, channels, depth, height, width  = feature_oi.size()
-
-        proj_query = self.query_conv(feature_mask).view(batch_size, -1, width * height * depth).permute(0, 2, 1)  # B X CX(N)
-        proj_key = self.key_conv(feature_zoom).view(batch_size, -1, width * height * depth)  # B X C x (*W*H)
-        energy = torch.bmm(proj_query, proj_key)  # transpose check
-        attention = self.softmax(energy)  # BX (N) X (N)
-        proj_value = self.value_conv(feature_oi).view(batch_size, -1, width * height * depth)  # B X C X N
-
-        att_x = torch.bmm(proj_value, attention.permute(0, 2, 1))
-        att_x = att_x.view(batch_size, channels, depth, height, width)
-
+        # batch_size, channels, depth, height, width  = feature_oi.size()
+        # proj_query = self.query_conv(feature_mask).view(batch_size, -1, width * height * depth).permute(0, 2, 1)  # B X CX(N)
+        # proj_key = self.key_conv(feature_zoom).view(batch_size, -1, width * height * depth)  # B X C x (*W*H)
+        # energy = torch.bmm(proj_query, proj_key)  # transpose check
+        # attention = self.softmax(energy)  # BX (N) X (N)
+        # proj_value = self.value_conv(feature_oi).view(batch_size, -1, width * height * depth)  # B X C X N
+        # att_x = torch.bmm(proj_value, attention.permute(0, 2, 1))
+        # att_x = att_x.view(batch_size, channels, depth, height, width)
         # att_x = self.gamma * att_x + feature_oi
         # print('gama\n', self.gamma)
-        att_x = att_x + feature_oi
-        self.finalconv = att_x.clone()
-
+        # att_x = att_x + feature_oi
+        # self.finalconv = att_x.clone()
         # classification head
-        res = self.avgpool(att_x)
+        res = self.avgpool(features)
         res = res.view(res.size(0), -1)
         res = self.fc(res)
 
