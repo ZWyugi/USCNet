@@ -1,15 +1,8 @@
-# -*- coding: utf-8 -*-
-# Time    : 2023/11/16 14:54
-# Author  : fanc
-# File    : resnet.py
 import math
 from functools import partial
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
 def get_inplanes():
     return [64, 128, 256, 512]
 
@@ -101,10 +94,8 @@ class Bottleneck(nn.Module):
         out = self.relu(out)
 
         return out
-
-
-class ResNet(nn.Module):
-
+# 定义ResNet模型
+class ResNetAdd(nn.Module):
     def __init__(self,
                  block,
                  layers,
@@ -113,8 +104,10 @@ class ResNet(nn.Module):
                  no_max_pool=False,
                  shortcut_type='B',
                  widen_factor=1.0,
-                 n_classes=2):
-        super().__init__()
+                 n_classes=2,
+                 dropout_rate=0.0,
+                 n_input_features=15):  # 新特征的维度，默认为15
+        super(ResNetAdd, self).__init__()
         if n_classes == 2:
             n_classes = 1
         block_inplanes = [int(x * widen_factor) for x in block_inplanes]
@@ -129,6 +122,7 @@ class ResNet(nn.Module):
                                padding=(3, 3, 3),
                                bias=False)
         self.bn1 = nn.BatchNorm3d(self.in_planes)
+
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool3d(kernel_size=3, stride=2, padding=1)
         self.layer1 = self._make_layer(block, block_inplanes[0], layers[0],
@@ -150,7 +144,11 @@ class ResNet(nn.Module):
                                        stride=2)
 
         self.avgpool = nn.AdaptiveAvgPool3d((1, 1, 1))
-        self.fc = nn.Linear(block_inplanes[3] * block.expansion, n_classes)
+
+        self.bn2 = nn.BatchNorm1d(block_inplanes[3] * block.expansion + n_input_features)
+        self.fc = nn.Linear(block_inplanes[3] * block.expansion + n_input_features, n_classes)  # 在全连接层之前增加新特征维度
+
+        self.dropout = nn.Dropout(p=dropout_rate)
 
         for m in self.modules():
             if isinstance(m, nn.Conv3d):
@@ -195,9 +193,7 @@ class ResNet(nn.Module):
             layers.append(block(self.in_planes, planes))
 
         return nn.Sequential(*layers)
-
-    def forward(self, x):
-
+    def forward(self, x, new_data=None):  # 修改forward方法，接收新的特征
         out = []
         out.append(x)
         x = self.conv1(x)
@@ -216,61 +212,46 @@ class ResNet(nn.Module):
         out.append(x)
         x = self.avgpool(x)
         x = x.view(x.size(0), -1)
+
+        if new_data is not None:
+            # 将新特征拼接到模型输出中
+            # print(x.shape, new_data.shape)
+            # print('max and min',x.max(), x.min(), new_data.max(), new_data.min())
+            x = torch.cat((x, new_data), dim=1)
+            x = self.bn2(x)
+            # print(x.shape)
+
+        x = self.dropout(x)
         x = self.fc(x)
         out.append(x)
         return out
-
 
 def generate_model(model_depth, **kwargs):
     assert model_depth in [10, 18, 34, 50, 101, 152, 200]
 
     if model_depth == 10:
-        model = ResNet(BasicBlock, [1, 1, 1, 1], get_inplanes(), **kwargs)
+        model = ResNetAdd(BasicBlock, [1, 1, 1, 1], get_inplanes(), **kwargs)
     elif model_depth == 18:
-        model = ResNet(BasicBlock, [2, 2, 2, 2], get_inplanes(), **kwargs)
+        model = ResNetAdd(BasicBlock, [2, 2, 2, 2], get_inplanes(), **kwargs)
     elif model_depth == 34:
-        model = ResNet(BasicBlock, [3, 4, 6, 3], get_inplanes(), **kwargs)
+        model = ResNetAdd(BasicBlock, [3, 4, 6, 3], get_inplanes(), **kwargs)
     elif model_depth == 50:
-        model = ResNet(Bottleneck, [3, 4, 6, 3], get_inplanes(), **kwargs)
+        model = ResNetAdd(Bottleneck, [3, 4, 6, 3], get_inplanes(), **kwargs)
     elif model_depth == 101:
-        model = ResNet(Bottleneck, [3, 4, 23, 3], get_inplanes(), **kwargs)
+        model = ResNetAdd(Bottleneck, [3, 4, 23, 3], get_inplanes(), **kwargs)
     elif model_depth == 152:
-        model = ResNet(Bottleneck, [3, 8, 36, 3], get_inplanes(), **kwargs)
+        model = ResNetAdd(Bottleneck, [3, 8, 36, 3], get_inplanes(), **kwargs)
     elif model_depth == 200:
-        model = ResNet(Bottleneck, [3, 24, 36, 3], get_inplanes(), **kwargs)
+        model = ResNetAdd(Bottleneck, [3, 24, 36, 3], get_inplanes(), **kwargs)
 
     return model
-
+# 在主程序中使用新的模型定义
 if __name__ == '__main__':
-    model = generate_model(10, n_classes=2)
-    loss_function = torch.nn.BCELoss()
-
-    # model_dict = model.state_dict()
-    # print(model_dict.keys())
-    # pretrain = torch.load(r"C:\Users\Asus\Desktop\KidneyStone\models\r3d18_K_200ep.pth", map_location='cpu')
-    # print(pretrain['state_dict'].keys())
-    # old_keys = pretrain['state_dict'].keys()
-    # for k in old_keys:
-    #     print(k)
-    #     break
-    # pretrained_dict = {k: v for k, v in pretrain['state_dict'].items() if
-    #                    k in model_dict and model_dict[k].size() == v.size()}
-    # model_dict.update(pretrained_dict)
-    # model.load_state_dict(model_dict)
-    model.train()
-    img = torch.randn(1, 1, 48, 48, 48)
-    # label = torch.randint(3, (2, 1, 1))
-    out = model(img)
+    model = ResNetAdd(BasicBlock, [1, 1, 1, 1], get_inplanes(), n_classes=2, dropout_rate=0, n_input_features=16)
+    model.train()  # 训练模式
+    img = torch.randn(1, 1, 48, 48, 48)  # 模拟输入数据
+    new_data = torch.randn(1, 16)  # 新特征数据
+    out = model(img, new_data)  # 模型前向传播
     for i in out:
-        print(i.shape)
-    # pred = torch.sigmoid(out)
-    # pred = torch.softmax(out, dim=1)
-    # print('label:{}-out:{}-pred:{}'.format(label, out, pred))
-    from utils import calculate_acc_sigmoid
-
-    # print(calculate_acc_sigmoid(pred, torch.tensor([[0.], [1.]])))
-    # print(loss_function(pred, torch.tensor([[0.]])).item())
-    # print(loss_function(pred, torch.tensor([[1.]])).item())
-    # pred = torch.round(pred)
-    # print(pred)
-    # print(F.softmax(out[-1], dim=-1).argmax(1, keepdim=True))
+        print(i.shape)  # 打印模型各层输出的形状
+    print(model)

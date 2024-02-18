@@ -5,7 +5,7 @@ from monai.networks.nets.vit import ViT
 from monai.utils import ensure_tuple_rep
 from src.models.networks.module import ResEncoder
 import torch.nn.functional as F
-
+from src.models.networks.resnet import generate_model
 class Conv3d_wd(nn.Conv3d):
     def __init__(self, in_channels, out_channels, kernel_size, stride=(1, 1, 1), padding=(0, 0, 0), dilation=(1, 1, 1),
                  groups=1, bias=False):
@@ -95,6 +95,7 @@ class ResBlock(nn.Module):
 class SC_Net(nn.Module):
     def __init__(self,
                  in_channels: 512,
+                 out_features: 2,
                  img_size: Union[Sequence[int], int],
                  hidden_size: int = 768,
                  mlp_dim: int = 3072,
@@ -103,9 +104,11 @@ class SC_Net(nn.Module):
                  dropout_rate: float = 0.0,
                  spatial_dims: int = 3,
                  deep_supervision=False,
-                 norm_cfg='BN', activation_cfg='ReLU', weight_std=False
+                 norm_cfg='BN', activation_cfg='ReLU', weight_std=False, cla=False, seg=True
                  ):
         super().__init__()
+        self.cla = cla
+        self.seg = seg
         self.num_layers = 15
         img_size = ensure_tuple_rep(img_size, spatial_dims)
         self.patch_size = ensure_tuple_rep(1, spatial_dims)
@@ -127,6 +130,7 @@ class SC_Net(nn.Module):
             spatial_dims=spatial_dims,
         )
 
+        self.resencoder = generate_model(10)
         # skip upsample
         self.transposeconv_skip4 = nn.ConvTranspose3d(768, 512, kernel_size=(2, 2, 2), stride=(2, 2, 2), bias=False)
         self.transposeconv_skip3 = nn.ConvTranspose3d(768, 512, kernel_size=(2, 2, 2), stride=(2, 2, 2), bias=False)
@@ -140,14 +144,11 @@ class SC_Net(nn.Module):
         self.transposeconv_skip0_3 = nn.ConvTranspose3d(256, 128, kernel_size=(2, 2, 2), stride=(2, 2, 2), bias=False)
         self.transposeconv_skip0_4 = nn.ConvTranspose3d(128, 64, kernel_size=(2, 2, 2), stride=(2, 2, 2), bias=False)
 
-
-
         # decoder upsample
         self.transposeconv_stage3 = nn.ConvTranspose3d(512, 256, kernel_size=(2, 2, 2), stride=(2, 2, 2), bias=False)
         self.transposeconv_stage2 = nn.ConvTranspose3d(256, 128, kernel_size=(2, 2, 2), stride=(2, 2, 2), bias=False)
         self.transposeconv_stage1 = nn.ConvTranspose3d(128, 64, kernel_size=(2, 2, 2), stride=(2, 2, 2), bias=False)
-        self.transposeconv_stage0 = nn.ConvTranspose3d(64, 64, kernel_size=(1, 2, 2), stride=(1, 2, 2), bias=False)
-
+        self.transposeconv_stage0 = nn.ConvTranspose3d(64, 64, kernel_size=(2, 2, 2), stride=(2, 2, 2), bias=False)
 
         # decoder resnet
         self.stage4_de = ResBlock(1024, 512, norm_cfg, activation_cfg, weight_std=weight_std)
@@ -188,6 +189,9 @@ class SC_Net(nn.Module):
         self.sigmoid = nn.Sigmoid()
         self.relu = nn.ReLU()
 
+        self.avgpool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.liner0 = nn.Linear(768, 512)
+        self.liner1 = nn.Linear(512, out_features)
 
         self.proj_axes = (0, spatial_dims + 1) + tuple(d + 1 for d in range(spatial_dims))
         self.proj_view_shape = list(self.feat_size) + [self.hidden_size]
@@ -198,89 +202,97 @@ class SC_Net(nn.Module):
         x = x.permute(self.proj_axes).contiguous()
         return x
 
-    def forward(self, res_encoder_output):
-        transencoder_output, hidden_states_out = self.vit(res_encoder_output[-1])
-        # self.transencoder_output = self.proj_feat(transencoder_output)
-        skip4 = self.transposeconv_skip4(self.proj_feat(transencoder_output))
-        skip3 = self.cnn_skip3(self.transposeconv_skip3(self.proj_feat(hidden_states_out[-4])))
+    def forward(self, x):
+        res_encoder_output = self.resencoder(x)[:-1]
+        if self.seg:
+            transencoder_output, hidden_states_out = self.vit(res_encoder_output[-1])
+            # self.transencoder_output = self.proj_feat(transencoder_output)
+            skip4 = self.transposeconv_skip4(self.proj_feat(transencoder_output))
+            skip3 = self.cnn_skip3(self.transposeconv_skip3(self.proj_feat(hidden_states_out[-4])))
 
-        #ag1
-        ag1_cnn1 = self.ag_cnn1(skip4)
-        ag1_cnn2 = self.ag_cnn1(skip3)
-        ag1_alpha1 = ag1_cnn1 + ag1_cnn2
-        ag1_cnn3 = self.ag_cnn1(self.relu(ag1_alpha1))
-        ag1_alpha2 = self.sigmoid(ag1_cnn3)
-        ag1_out = torch.mul(skip4, ag1_alpha2)
-        #######
+            #ag1
+            ag1_cnn1 = self.ag_cnn1(skip4)
+            ag1_cnn2 = self.ag_cnn1(skip3)
+            ag1_alpha1 = ag1_cnn1 + ag1_cnn2
+            ag1_cnn3 = self.ag_cnn1(self.relu(ag1_alpha1))
+            ag1_alpha2 = self.sigmoid(ag1_cnn3)
+            ag1_out = torch.mul(skip4, ag1_alpha2)
+            #######
 
-        resout_up0 = self.transposeconv_resout_up0(res_encoder_output[-1])
-        out1 = torch.cat([ag1_out, resout_up0], dim=1)
-        out1 = self.stage4_de(out1)
-        out1 = self.transposeconv_stage3(out1)
-        skip2_1 = self.cnn_skip2_1(self.transposeconv_skip2_1(self.proj_feat(hidden_states_out[-7])))
-        skip2_2 = self.cnn_skip2_2(self.transposeconv_skip2_2(skip2_1))
+            resout_up0 = self.transposeconv_resout_up0(res_encoder_output[-1])
+            out1 = torch.cat([ag1_out, resout_up0], dim=1)
+            out1 = self.stage4_de(out1)
+            out1 = self.transposeconv_stage3(out1)
+            skip2_1 = self.cnn_skip2_1(self.transposeconv_skip2_1(self.proj_feat(hidden_states_out[-7])))
+            skip2_2 = self.cnn_skip2_2(self.transposeconv_skip2_2(skip2_1))
 
-        #ag2
-        ag2_cnn1 = self.ag_cnn2(out1)
-        ag2_cnn2 = self.ag_cnn2(skip2_2)
-        ag2_alpha1 = ag2_cnn1 + ag2_cnn2
-        ag2_cnn3 = self.ag_cnn2(self.relu(ag2_alpha1))
-        ag2_alpha2 = self.sigmoid(ag2_cnn3)
-        ag2_out = torch.mul(out1, ag2_alpha2)
-        ######
+            #ag2
+            ag2_cnn1 = self.ag_cnn2(out1)
+            ag2_cnn2 = self.ag_cnn2(skip2_2)
+            ag2_alpha1 = ag2_cnn1 + ag2_cnn2
+            ag2_cnn3 = self.ag_cnn2(self.relu(ag2_alpha1))
+            ag2_alpha2 = self.sigmoid(ag2_cnn3)
+            ag2_out = torch.mul(out1, ag2_alpha2)
+            ######
 
-        resout_up1 = self.transposeconv_resout_up1(res_encoder_output[-2])
-        out2 = torch.cat([ag2_out, resout_up1], dim=1)
-        out2 = self.stage3_de(out2)
-        out2 = self.transposeconv_stage2(out2)
-        skip1_1 = self.cnn_skip1_1(self.transposeconv_skip1_1(self.proj_feat(hidden_states_out[-10])))
-        skip1_2 = self.cnn_skip1_2(self.transposeconv_skip1_2(skip1_1))
-        skip1_3 = self.cnn_skip1_3(self.transposeconv_skip1_3(skip1_2))
+            resout_up1 = self.transposeconv_resout_up1(res_encoder_output[-2])
+            out2 = torch.cat([ag2_out, resout_up1], dim=1)
+            out2 = self.stage3_de(out2)
+            out2 = self.transposeconv_stage2(out2)
+            skip1_1 = self.cnn_skip1_1(self.transposeconv_skip1_1(self.proj_feat(hidden_states_out[-10])))
+            skip1_2 = self.cnn_skip1_2(self.transposeconv_skip1_2(skip1_1))
+            skip1_3 = self.cnn_skip1_3(self.transposeconv_skip1_3(skip1_2))
 
-        #ag3
-        ag3_cnn1 = self.ag_cnn3(out2)
-        ag3_cnn2 = self.ag_cnn3(skip1_3)
-        ag3_alpha1 = ag3_cnn1 + ag3_cnn2
-        ag3_cnn3 = self.ag_cnn3(self.relu(ag3_alpha1))
-        ag3_alpha2 = self.sigmoid(ag3_cnn3)
-        ag3_out = torch.mul(out2, ag3_alpha2)
-        ######
+            #ag3
+            ag3_cnn1 = self.ag_cnn3(out2)
+            ag3_cnn2 = self.ag_cnn3(skip1_3)
+            ag3_alpha1 = ag3_cnn1 + ag3_cnn2
+            ag3_cnn3 = self.ag_cnn3(self.relu(ag3_alpha1))
+            ag3_alpha2 = self.sigmoid(ag3_cnn3)
+            ag3_out = torch.mul(out2, ag3_alpha2)
+            ######
 
-        resout_up2 = self.transposeconv_resout_up2(res_encoder_output[-3])
-        out3 = torch.cat([ag3_out, resout_up2], dim=1)
-        out3 = self.stage2_de(out3)
-        out3 = self.transposeconv_stage1(out3)
-        skip0_1 = self.cnn_skip0_1(self.transposeconv_skip0_1(self.proj_feat(hidden_states_out[-13])))
-        skip0_2 = self.cnn_skip0_2(self.transposeconv_skip0_2(skip0_1))
-        skip0_3 = self.cnn_skip0_3(self.transposeconv_skip0_3(skip0_2))
-        skip0_4 = self.cnn_skip0_4(self.transposeconv_skip0_4(skip0_3))
+            resout_up2 = self.transposeconv_resout_up2(res_encoder_output[-3])
+            out3 = torch.cat([ag3_out, resout_up2], dim=1)
+            out3 = self.stage2_de(out3)
+            out3 = self.transposeconv_stage1(out3)
+            skip0_1 = self.cnn_skip0_1(self.transposeconv_skip0_1(self.proj_feat(hidden_states_out[-13])))
+            skip0_2 = self.cnn_skip0_2(self.transposeconv_skip0_2(skip0_1))
+            skip0_3 = self.cnn_skip0_3(self.transposeconv_skip0_3(skip0_2))
+            skip0_4 = self.cnn_skip0_4(self.transposeconv_skip0_4(skip0_3))
 
-        #ag4
-        ag4_cnn1 = self.ag_cnn4(out3)
-        ag4_cnn2 = self.ag_cnn4(skip0_4)
-        ag4_alpha1 = ag4_cnn1 + ag4_cnn2
-        ag4_cnn3 = self.ag_cnn4(self.relu(ag4_alpha1))
-        ag4_alpha2 = self.sigmoid(ag4_cnn3)
-        ag4_out = torch.mul(out3, ag4_alpha2)
-        ######
+            #ag4
+            ag4_cnn1 = self.ag_cnn4(out3)
+            ag4_cnn2 = self.ag_cnn4(skip0_4)
+            ag4_alpha1 = ag4_cnn1 + ag4_cnn2
+            ag4_cnn3 = self.ag_cnn4(self.relu(ag4_alpha1))
+            ag4_alpha2 = self.sigmoid(ag4_cnn3)
+            ag4_out = torch.mul(out3, ag4_alpha2)
+            # ######
 
-        resout_up3 = self.transposeconv_resout_up3(res_encoder_output[-4])
-        out4 = torch.cat([ag4_out, resout_up3], dim=1)
-        out4 = self.stage1_de(out4)
-        out4 = self.transposeconv_stage0(out4)
-        cbr_skip = self.cbr2(self.cbr1(res_encoder_output[-5]))
+            resout_up3 = self.transposeconv_resout_up3(res_encoder_output[-4])
+            out4 = torch.cat([ag4_out, resout_up3], dim=1)
+            out4 = self.stage1_de(out4)
+            #out4 = self.transposeconv_stage0(out4)
+            cbr_skip = self.cbr2(self.cbr1(res_encoder_output[-5]))
 
-        #ag5
-        ag5_cnn1 = self.ag_cnn5(out4)
-        ag5_cnn2 = self.ag_cnn5(cbr_skip)
-        ag5_alpha1 = ag5_cnn1 + ag5_cnn2
-        ag5_cnn3 = self.ag_cnn5(self.relu(ag5_alpha1))
-        ag5_alpha2 = self.sigmoid(ag5_cnn3)
-        ag5_out = torch.mul(out4, ag5_alpha2)
-        ######
+            #ag5
+            ag5_cnn1 = self.ag_cnn5(out4)
+            ag5_cnn2 = self.ag_cnn5(cbr_skip)
+            ag5_alpha1 = ag5_cnn1 + ag5_cnn2
+            ag5_cnn3 = self.ag_cnn5(self.relu(ag5_alpha1))
+            ag5_alpha2 = self.sigmoid(ag5_cnn3)
+            ag5_out = torch.mul(out4, ag5_alpha2)
+            ######
+            out5 = self.stage0_de(ag5_out)
+            seg_out = self.sigmoid(self.cls_conv(out5))
+        if self.cla:
+            # classification
+            cla_out = self.avgpool(self.proj_feat(transencoder_output))
+            cla_out = cla_out.view(cla_out.shape[0], -1)
+            cla_out = self.liner1(self.liner0(cla_out))
 
-        out5 = self.stage0_de(ag5_out)
-        out_final = self.sigmoid(self.cls_conv(out5))
+        if not self.cla:
+            cla_out = None
 
-
-        return out_final
+        return cla_out, seg_out

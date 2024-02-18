@@ -1,4 +1,7 @@
-import logging
+# -*- coding: utf-8 -*-
+# Time    : 2023/12/23 13:48
+# Author  : fanc
+# File    : train_sc.py
 import time
 import os
 import argparse
@@ -8,23 +11,19 @@ import torch.nn.functional as F
 import monai.losses
 from monai.bundle import ConfigParser
 import torch
-import torch.optim as optim
+
 from torch.utils.tensorboard import SummaryWriter
-import sys
 from tqdm import tqdm
-from src.models.networks.module import ResEncoder, CAL_Net
-from src.models.networks.resnet import generate_model
-from src.models.networks.sc_net import SC_Net
-import shutil
-from utils import AverageMeter, generate_patch_mask, returnCAM, load_pretrain
+from src.models.net import SC_Net
+from src.models.resnet import generate_model
+from utils import AverageMeter, load_pretrain
 from src.dataloader.load_data import split_data, my_dataloader
 from torch.nn import DataParallel
 import itertools
 import functools
-import sklearn.metrics
-from sklearn.metrics import accuracy_score
 
-def main(args, save_path):
+
+def main(args):
     config = ConfigParser()
     config.read_config(args.config_file)
     task = [int(i) for i in re.findall('\d', str(args.task))]
@@ -32,10 +31,9 @@ def main(args, save_path):
     train_seg = True if 0 in task else False
     train_cla = True if 1 in task else False
 
-    # save_path = os.path.join(args.output_path, "seg-{}_cla-{}".format(train_seg, train_cla))
-    # start_time = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-    # save_path = os.path.join(save_path, start_time)
-
+    save_path = os.path.join(args.output_path, "seg-{}_cla-{}".format(train_seg, train_cla))
+    start_time = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    save_path = os.path.join(save_path, start_time)
     model_dir = os.path.join(save_path, "models")
     summary_dir = os.path.join(save_path, "summarys")
     os.makedirs(model_dir, exist_ok=True)
@@ -45,19 +43,26 @@ def main(args, save_path):
     test_writer = SummaryWriter(os.path.join(summary_dir, 'test'), flush_secs=2)
 
     #model
-    [d, h, w] = [int(i) for i in re.findall('\d+',args.input_size)]
-    img_size = (d//16, h//16, w//16)
+    # [d, h, w] = [int(i) for i in re.findall('\d+',args.input_size)]
+    [d, h, w] = [48, 48, 48]
+    img_size = (d//16, h//32, w//32)
+    if train_cla:
+        cls_net = generate_model(34)
+        cls_net = load_pretrain(args.pretrain_cls, cls_net)
 
-    sc_net = SC_Net(in_channels=512, out_features=args.num_classes, img_size=img_size, cla=train_cla, seg=train_seg)
-    sc_net = load_pretrain(args.pretrain_sc, sc_net)
+    if train_seg:
+        seg_net = SC_Net(in_channels=512, out_features=args.num_classes, img_size=img_size, cla=train_cla, seg=train_seg)
+        seg_net = load_pretrain(args.pretrain_seg, seg_net)
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     if torch.cuda.device_count() > 1:
-        sc_net = DataParallel(sc_net)
+        seg_net = DataParallel(seg_net)
+        cls_net = DataParallel(cls_net)
 
-    sc_net.to(device)
+    seg_net.to(device)
+    cls_net.to(device)
     optimizer = torch.optim.Adam(
-        params=itertools.chain(sc_net.parameters()),
+        params=itertools.chain(cls_net.parameters()),
         lr=args.lr,
         betas=args.betas,
         weight_decay=args.weight_decay
@@ -86,22 +91,21 @@ def main(args, save_path):
         else:
             metrics_cla[k.__class__.__name__] = k
     # data
-    with open('configs/dataset.json', 'r', encoding='utf-8') as f:
-        dataset = json.load(f)
-    data_dir = dataset['data_dir']
-    infos_name = dataset['infos_name']
-    filter_volume = dataset['filter_volume']
-    train_info, val_info = split_data(data_dir, infos_name, filter_volume, rate=0.8)
-    train_data_loader = my_dataloader(data_dir,
+    train_info, val_info = split_data(args.input_path, rate=0.8)
+    train_data_loader = my_dataloader(args.input_path,
                                       train_info,
                                       batch_size=args.batch_size,
                                       shuffle=True,
-                                      num_workers=args.num_workers)
-    test_data_loader = my_dataloader(data_dir,
+                                      num_workers=args.num_workers,
+                                      input_size=args.input_size,
+                                      task=[0, 1])
+    test_data_loader = my_dataloader(args.input_path,
                                      val_info,
                                      batch_size=args.batch_size,
                                      shuffle=False,
-                                     num_workers=args.num_workers)
+                                     num_workers=args.num_workers,
+                                     input_size=args.input_size,
+                                     task=[0, 1])
 
     print("Start training")
     running_loss = AverageMeter()
@@ -274,7 +278,7 @@ if __name__ == '__main__':
     parser.add_argument('--pretrain-sc', type=str, default=None)
     parser.add_argument('--input-path', type=str, default='/home/KidneyData/data')
     parser.add_argument('--output-path', type=str, default='./results')
-    parser.add_argument('--input-size', type=str, default="48, 48, 48")
+    parser.add_argument('--input-size', type=str, default=(128, 128, 128))
     parser.add_argument('--num-classes', type=int, default=2)
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--save-epoch', type=int, default=10)
@@ -294,16 +298,9 @@ if __name__ == '__main__':
 
     # 将参数字典保存为 JSON 文件
     now = time.strftime('%y%m%d%H%M', time.localtime())
-    if not os.path.exists(f'./results/{now}'):
-        os.makedirs(f'./results/{now}')
-    save_path = f'./results/{now}'
-    with open(os.path.join(save_path, 'train_config.json'), 'w') as fp:
+    with open(f'./configs/training_config_{now}.json', 'w') as fp:
         json.dump(args_dict, fp, indent=4)
-    print(f"Training configuration saved to {now}")
 
-    # with open(f'./configs/training_config_{now}.json', 'w') as fp:
-    #     json.dump(args_dict, fp, indent=4)
-    #
-    # print(f"Training configuration saved to training_config_{now}.json")
+    print(f"Training configuration saved to training_config_{now}.json")
 
-    main(opt, save_path=save_path)
+    main(opt)

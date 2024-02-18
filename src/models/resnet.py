@@ -44,6 +44,7 @@ class BasicBlock(nn.Module):
         self.bn2 = nn.BatchNorm3d(planes)
         self.downsample = downsample
         self.stride = stride
+        self.dropout = nn.Dropout3d(p=0.3)
 
     def forward(self, x):
         residual = x
@@ -54,6 +55,7 @@ class BasicBlock(nn.Module):
 
         out = self.conv2(out)
         out = self.bn2(out)
+        out = self.dropout(out)
 
         if self.downsample is not None:
             residual = self.downsample(x)
@@ -113,7 +115,8 @@ class ResNet(nn.Module):
                  no_max_pool=False,
                  shortcut_type='B',
                  widen_factor=1.0,
-                 n_classes=2):
+                 n_classes=2,
+                 dropout_rate=0.0):
         super().__init__()
         if n_classes == 2:
             n_classes = 1
@@ -151,6 +154,9 @@ class ResNet(nn.Module):
 
         self.avgpool = nn.AdaptiveAvgPool3d((1, 1, 1))
         self.fc = nn.Linear(block_inplanes[3] * block.expansion, n_classes)
+
+        self.dropout = nn.Dropout(p=dropout_rate)
+
 
         for m in self.modules():
             if isinstance(m, nn.Conv3d):
@@ -216,6 +222,7 @@ class ResNet(nn.Module):
         out.append(x)
         x = self.avgpool(x)
         x = x.view(x.size(0), -1)
+        x = self.dropout(x)
         x = self.fc(x)
         out.append(x)
         return out
@@ -242,8 +249,8 @@ def generate_model(model_depth, **kwargs):
     return model
 
 if __name__ == '__main__':
-    model = generate_model(10, n_classes=2)
-    loss_function = torch.nn.BCELoss()
+    model = generate_model(10, n_classes=2, dropout_rate=0)
+    # loss_function = torch.nn.BCELoss()
 
     # model_dict = model.state_dict()
     # print(model_dict.keys())
@@ -261,9 +268,10 @@ if __name__ == '__main__':
     img = torch.randn(1, 1, 48, 48, 48)
     # label = torch.randint(3, (2, 1, 1))
     out = model(img)
+
     for i in out:
         print(i.shape)
-    # pred = torch.sigmoid(out)
+    # # pred = torch.sigmoid(out)
     # pred = torch.softmax(out, dim=1)
     # print('label:{}-out:{}-pred:{}'.format(label, out, pred))
     from utils import calculate_acc_sigmoid

@@ -94,6 +94,7 @@ class ResEncoder(nn.Module):
         self.depth = depth
         block, layers = self.arch_settings[depth]
         self.inplanes = 64
+        self.maxpool = nn.MaxPool3d(kernel_size=3, stride=1, padding=1)
         self.conv1 = conv3x3x3(in_channels, 64, kernel_size=3, stride=(1, 1, 1), padding=1, bias=False, weight_std=weight_std)
         self.norm1 = Norm_layer(norm_cfg, 64)
         self.nonlin = Activation_layer(activation_cfg, inplace=True)
@@ -146,7 +147,7 @@ class ResEncoder(nn.Module):
         x = self.norm1(x)
         x = self.nonlin(x)
         out.append(x)
-
+        x = self.maxpool(x)
         x = self.layer1(x)
         out.append(x)
         x = self.layer2(x)
