@@ -1,13 +1,12 @@
 import os
 os.environ['KMP_DUPLICATE_LIB_OK']='TRUE'
-import imp
 from pydoc import cli
 from traceback import print_tb
 from grpc import ClientCallDetails
 import torch
 from torch import nn
 # from torchmtlr import MTLR
-
+import torch.nn.functional as F
 from typing import Sequence, Tuple, Union
 
 from monai.networks.blocks.dynunet_block import UnetOutBlock
@@ -47,6 +46,7 @@ class UNETR(nn.Module):
             res_block: bool = True,
             dropout_rate: float = 0.0,
             spatial_dims: int = 3,
+            patch_size: int = 16
     ) -> None:
 
         super().__init__()
@@ -59,7 +59,7 @@ class UNETR(nn.Module):
 
         self.num_layers = 12
         img_size = ensure_tuple_rep(img_size, spatial_dims)
-        self.patch_size = ensure_tuple_rep(16, spatial_dims)
+        self.patch_size = ensure_tuple_rep(patch_size, spatial_dims)
         self.feat_size = tuple(img_d // p_d for img_d, p_d in zip(img_size, self.patch_size))
         self.hidden_size = hidden_size
         self.classification = False
@@ -497,16 +497,535 @@ class PatchEmbeddingBlock(nn.Module):
         embeddings = self.dropout(embeddings)
         return embeddings
 
+class ViTNoEmbed(nn.Module):
+    """
+    Vision Transformer (ViT), based on: "Dosovitskiy et al.,
+    An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale <https://arxiv.org/abs/2010.11929>"
+    """
+
+    def __init__(
+            self,
+            in_channels: int,
+            img_size: Union[Sequence[int], int],
+            patch_size: Union[Sequence[int], int],
+            hidden_size: int = 768,
+            mlp_dim: int = 3072,
+            num_layers: int = 12,
+            num_heads: int = 12,
+            pos_embed: str = "conv",
+            classification: bool = False,
+            num_classes: int = 2,
+            dropout_rate: float = 0.0,
+            spatial_dims: int = 3,
+    ) -> None:
+        """
+        Args:
+            in_channels: dimension of input channels.
+            img_size: dimension of input image.
+            patch_size: dimension of patch size.
+            hidden_size: dimension of hidden layer.
+            mlp_dim: dimension of feedforward layer.
+            num_layers: number of transformer blocks.
+            num_heads: number of attention heads.
+            pos_embed: position embedding layer type.
+            classification: bool argument to determine if classification is used.
+            num_classes: number of classes if classification is used.
+            dropout_rate: faction of the input units to drop.
+            spatial_dims: number of spatial dimensions.
+        """
+
+        super().__init__()
+
+        if not (0 <= dropout_rate <= 1):
+            raise ValueError("dropout_rate should be between 0 and 1.")
+
+        if hidden_size % num_heads != 0:
+            raise ValueError("hidden_size should be divisible by num_heads.")
+
+        self.classification = classification
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(hidden_size, mlp_dim, num_heads, dropout_rate) for i in range(num_layers)]
+        )
+        self.norm = nn.LayerNorm(hidden_size)
+        if self.classification:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+            self.classification_head = nn.Sequential(nn.Linear(hidden_size, num_classes), nn.Tanh())
+
+    def forward(self, x):
+
+        # x = self.patch_embedding(x)
+
+        if self.classification:
+            cls_token = self.cls_token.expand(x.shape[0], -1, -1)
+            x = torch.cat((cls_token, x), dim=1)
+        hidden_states_out = []
+        for blk in self.blocks:
+            x = blk(x)
+            hidden_states_out.append(x)
+        x = self.norm(x)
+        if self.classification:
+            x = self.classification_head(x[:, 0])
+
+        return x, hidden_states_out
+
+from monai.networks.blocks import PatchEmbeddingBlock as PatchEmbeddingBlockOriginal
+class DoubleFlow(nn.Module):
+    def __init__(
+                    self,
+                    in_channels: int,
+                    out_channels: int,
+                    img_size: Union[Sequence[int], int],
+                    feature_size: int = 16,
+                    hidden_size: int = 768,
+                    mlp_dim: int = 3072,
+                    num_heads: int = 12,
+                    pos_embed: str = "conv",
+                    norm_name: Union[Tuple, str] = "instance",
+                    conv_block: bool = True,
+                    res_block: bool = True,
+                    dropout_rate: float = 0.0,
+                    spatial_dims: int = 3,
+                    patch_size: int = 8
+                ) -> None:
+        super().__init__()
+
+        if not (0 <= dropout_rate <= 1):
+            raise ValueError("dropout_rate should be between 0 and 1.")
+
+        if hidden_size % num_heads != 0:
+            raise ValueError("hidden_size should be divisible by num_heads.")
+
+        self.num_layers = 12
+        img_size = ensure_tuple_rep(img_size, spatial_dims)
+        self.patch_size = ensure_tuple_rep(patch_size, spatial_dims)
+        self.feat_size = tuple(img_d // p_d for img_d, p_d in zip(img_size, self.patch_size))
+        self.hidden_size = hidden_size
+
+        self.classification = False
+
+        self.img_patch_embedding = PatchEmbeddingBlockOriginal(
+            in_channels=in_channels,
+            img_size=img_size,
+            patch_size=self.patch_size,
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            pos_embed=pos_embed,
+            dropout_rate=dropout_rate,
+            spatial_dims=spatial_dims,
+        )
+        self.patch_embedding = PatchEmbeddingBlock(
+            in_channels=in_channels,
+            img_size=img_size,
+            patch_size=self.patch_size,
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            pos_embed=pos_embed,
+            dropout_rate=dropout_rate,
+            spatial_dims=spatial_dims,
+        )
+
+
+        self.vit = ViTNoEmbed(
+            in_channels=in_channels,
+            img_size=img_size,
+            patch_size=self.patch_size,
+            hidden_size=hidden_size,
+            mlp_dim=mlp_dim,
+            num_layers=self.num_layers,
+            num_heads=num_heads,
+            pos_embed=pos_embed,
+            classification=self.classification,
+            dropout_rate=dropout_rate,
+            spatial_dims=spatial_dims,
+        )
+
+        self.encoder1 = UnetrBasicBlock(
+            spatial_dims=spatial_dims,
+            in_channels=in_channels,
+            out_channels=feature_size,
+            kernel_size=3,
+            stride=1,
+            norm_name=norm_name,
+            res_block=res_block,
+        )
+        self.encoder2 = UnetrPrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=hidden_size,
+            out_channels=feature_size * 2,
+            num_layer=2,
+            kernel_size=3,
+            stride=1,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            conv_block=conv_block,
+            res_block=res_block,
+        )
+        self.encoder3 = UnetrPrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=hidden_size,
+            out_channels=feature_size * 4,
+            num_layer=1,
+            kernel_size=3,
+            stride=1,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            conv_block=conv_block,
+            res_block=res_block,
+        )
+        self.encoder4 = UnetrPrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=hidden_size,
+            out_channels=feature_size * 8,
+            num_layer=0,
+            kernel_size=3,
+            stride=1,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            conv_block=conv_block,
+            res_block=res_block,
+        )
+        self.decoder5 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=hidden_size,
+            out_channels=feature_size * 8,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=res_block,
+        )
+        self.decoder4 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size * 8,
+            out_channels=feature_size * 4,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=res_block,
+        )
+        self.decoder3 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size * 4,
+            out_channels=feature_size * 2,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=res_block,
+        )
+        self.decoder2 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size * 2,
+            out_channels=feature_size,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=res_block,
+        )
+        self.out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size, out_channels=out_channels)
+        self.fc = nn.Sequential(nn.Linear(hidden_size, 256),
+                                nn.BatchNorm1d(256),
+                                nn.ReLU(inplace=True),
+                                nn.Dropout(0.5),
+                                nn.Linear(256, 1))
+
+    def proj_feat(self, x, hidden_size, feat_size):
+        new_view = (x.size(0), *feat_size, hidden_size)
+        x = x.view(new_view)
+        new_axes = (0, len(x.shape) - 1) + tuple(d + 1 for d in range(len(feat_size)))
+        x = x.permute(new_axes).contiguous()
+        return x
+
+    def forward(self, x):
+        img_in, clin_in = x
+
+        # Image path
+        img = self.img_patch_embedding(img_in) # 216*h
+        img_clin = self.patch_embedding(x) # 217*h
+        # clinical and img out the end layer : x
+        x, _ = self.vit(img_clin)
+        # img out all layers: hidden_states_out
+        _, hidden_states_out = self.vit(img)
+
+        enc1 = self.encoder1(img_in)
+        x2 = hidden_states_out[3]
+        enc2 = self.encoder2(self.proj_feat(x2, self.hidden_size, self.feat_size))
+        x3 = hidden_states_out[6]
+        enc3 = self.encoder3(self.proj_feat(x3, self.hidden_size, self.feat_size))
+        x4 = hidden_states_out[9]
+        enc4 = self.encoder4(self.proj_feat(x4, self.hidden_size, self.feat_size))
+
+        dec4 = self.proj_feat(_, self.hidden_size, self.feat_size)
+        dec3 = self.decoder5(dec4, enc4)
+        dec2 = self.decoder4(dec3, enc3)
+        dec1 = self.decoder3(dec2, enc2)
+        # print(f'img_in:{img_in.shape}\nz3{x2.shape}\nz6{x3.shape}\nz9{x4.shape}\nz12{_.shape}')
+        #
+        # for i in [enc1, enc2, enc3, enc4]:
+        #     print(i.shape)
+        # for i in [dec4, dec3, dec2, dec1]:
+        #     print(i.shape)
+
+
+        segmentation_output = self.decoder2(dec1, enc1)
+
+        x = torch.mean(x, dim=1)
+        classification_output = self.fc(x)
+
+        return self.out(segmentation_output), classification_output
+
+class ehr_net(torch.nn.Module):
+    def __init__(self):
+        super(ehr_net, self).__init__()
+        # self.EHR_proj = nn.Sequential(nn.Linear(n_clin_var, hidden_size))
+        self.fc = nn.Sequential(nn.Linear(15, 256),
+                                nn.BatchNorm1d(256),
+                                nn.ReLU(inplace=True),
+                                nn.Dropout(0.5),
+                                nn.Linear(256, 1))
+    def forward(self, clin_var):
+        clin_var = self.fc(clin_var)
+        return clin_var
+
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, hidden_size):
+        super(CrossAttention, self).__init__()
+        self.hidden_size = hidden_size
+        # self.img_embed = PatchEmbeddingBlockOriginal(
+        #     in_channels=1, img_size=48, patch_size=16, hidden_size=hidden_size, num_heads=12)
+        #
+        # self.ehr_proj = nn.Linear(15, hidden_size).unsqueeze(0)
+        self.query_projection = nn.Linear(hidden_size, hidden_size)
+        self.key_projection = nn.Linear(hidden_size, hidden_size)
+        self.value_projection = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, q, k, v):
+        # 图像嵌入处理，作为键和值
+        # img_embedded = self.img_embed(img)  # 假设img_embed返回的是NxD的向量，N为图像补丁数量，D为隐藏层大小
+        keys = self.key_projection(k)
+        values = self.value_projection(v)
+        # EHR数据处理，作为查询
+        # ehr_projected = self.ehr_proj(ehr)  # 假设ehr为1x15的向量
+        query = self.query_projection(q)  # 增加批处理维度以匹配keys和values的维度
+        # 计算注意力分数
+        attention_scores = torch.matmul(query, keys.transpose(-2, -1))
+        attention_scores = attention_scores / torch.sqrt(torch.tensor(self.hidden_size, dtype=torch.float32))
+        # 归一化注意力权重
+        attention_weights = F.softmax(attention_scores, dim=-1)
+        # 计算上下文向量
+        context = torch.matmul(attention_weights, values)
+        return context
+
+class KSCNet(nn.Module):
+    def __init__(self,
+                 img_size: Union[Sequence[int], int],
+                 in_channels: int = 1,
+                 out_channels: int = 1,
+                 feature_size: int = 16,
+                 patch_size: int = 16,
+                 hidden_size: int = 384,
+                 num_heads: int = 12,
+                 mlp_dim: int = 3072,
+                 dropout_rate: float = 0.0,
+                 spatial_dims: int=3,
+                 norm_name: Union[Tuple, str] = "instance",
+                 conv_block: bool = True,
+                 res_block: bool = True,
+                 ):
+        super().__init__()
+
+        if not (0 <= dropout_rate <= 1):
+            raise ValueError("dropout_rate should be between 0 and 1.")
+
+        if hidden_size % num_heads != 0:
+            raise ValueError("hidden_size should be divisible by num_heads.")
+
+        self.num_layers = 12
+        img_size = ensure_tuple_rep(img_size, spatial_dims)
+        self.patch_size = ensure_tuple_rep(patch_size, spatial_dims)
+        self.feat_size = tuple(img_d // p_d for img_d, p_d in zip(img_size, self.patch_size))
+        self.hidden_size = hidden_size
+
+        # CT embedding and projection
+        self.img_embed = PatchEmbeddingBlockOriginal(
+            in_channels=in_channels, img_size=img_size, patch_size=patch_size, hidden_size=hidden_size, num_heads=num_heads)
+        # ehr projection
+        self.ehr_proj = nn.Linear(15, hidden_size)
+
+        self.cross_attention = CrossAttention(hidden_size=hidden_size)
+
+        self.vit = ViTNoEmbed(
+            in_channels=in_channels,
+            img_size=img_size,
+            patch_size=self.patch_size,
+            hidden_size=hidden_size,
+            mlp_dim=mlp_dim,
+            num_layers=self.num_layers,
+            num_heads=num_heads,
+            classification=False,
+            dropout_rate=dropout_rate,
+            spatial_dims=spatial_dims,
+        )
+        self.encoder1 = UnetrBasicBlock(
+            spatial_dims=spatial_dims,
+            in_channels=in_channels,
+            out_channels=feature_size,
+            kernel_size=3,
+            stride=1,
+            norm_name=norm_name,
+            res_block=res_block,
+        )
+        self.encoder2 = UnetrPrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=hidden_size,
+            out_channels=feature_size * 2,
+            num_layer=2,
+            kernel_size=3,
+            stride=1,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            conv_block=conv_block,
+            res_block=res_block,
+        )
+        self.encoder3 = UnetrPrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=hidden_size,
+            out_channels=feature_size * 4,
+            num_layer=1,
+            kernel_size=3,
+            stride=1,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            conv_block=conv_block,
+            res_block=res_block,
+        )
+        self.encoder4 = UnetrPrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=hidden_size,
+            out_channels=feature_size * 8,
+            num_layer=0,
+            kernel_size=3,
+            stride=1,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            conv_block=conv_block,
+            res_block=res_block,
+        )
+        self.decoder5 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=hidden_size,
+            out_channels=feature_size * 8,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=res_block,
+        )
+        self.decoder4 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size * 8,
+            out_channels=feature_size * 4,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=res_block,
+        )
+        self.decoder3 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size * 4,
+            out_channels=feature_size * 2,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=res_block,
+        )
+        self.decoder2 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size * 2,
+            out_channels=feature_size,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=res_block,
+        )
+        # seg out
+        self.out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size, out_channels=out_channels)
+
+        # cls out
+        self.fc = nn.Sequential(nn.Linear(hidden_size * 1, 256),
+                                nn.BatchNorm1d(256),
+                                nn.ReLU(inplace=True),
+                                nn.Dropout(0.5),
+                                nn.Linear(256, 1))
+
+
+    def proj_feat(self, x, hidden_size, feat_size):
+        new_view = (x.size(0), *feat_size, hidden_size)
+        x = x.view(new_view)
+        new_axes = (0, len(x.shape) - 1) + tuple(d + 1 for d in range(len(feat_size)))
+        x = x.permute(new_axes).contiguous()
+        return x
+
+    def forward(self, img, ehr):
+        img_embeded = self.img_embed(img)
+        ehr_proj = self.ehr_proj(ehr).unsqueeze(dim=1)
+
+        # img-ehr attention
+        # context_img_ehr = self.cross_attention(q=ehr_proj, k=img_embeded, v=img_embeded) # 1*hidden_size bad
+        context_img_ehr = self.cross_attention(q=img_embeded, k=ehr_proj, v=ehr_proj)  # 1*hidden_size
+        # seg path
+        _, hidden_states_out = self.vit(img_embeded)
+
+        enc1 = self.encoder1(img)
+        x2 = hidden_states_out[3]
+        enc2 = self.encoder2(self.proj_feat(x2, self.hidden_size, self.feat_size))
+        x3 = hidden_states_out[6]
+        enc3 = self.encoder3(self.proj_feat(x3, self.hidden_size, self.feat_size))
+        x4 = hidden_states_out[9]
+        enc4 = self.encoder4(self.proj_feat(x4, self.hidden_size, self.feat_size))
+
+        dec4 = self.proj_feat(_, self.hidden_size, self.feat_size)
+        dec3 = self.decoder5(dec4, enc4)
+        dec2 = self.decoder4(dec3, enc3)
+        dec1 = self.decoder3(dec2, enc2)
+
+        dec0 = self.decoder2(dec1, enc1)
+        seg_out = self.out(dec0)
+        z12_mean = torch.mean(hidden_states_out[-1], dim=1).unsqueeze(dim=1)
+        # seg-attention
+        context_seg_img_ehr = self.cross_attention(q=z12_mean, k=context_img_ehr, v=context_img_ehr)
+        # context_seg_img_ehr = torch.mean(context_seg_img_ehr, dim=1)
+        # print(z12_mean.shape, z12_mean.flatten(start_dim=1).shape, context_img_ehr.shape)
+
+        # context_seg_img_ehr = torch.cat((z12_mean, context_img_ehr), dim=1) # ronly clinical and ct
+        # context_seg_img_ehr = context_img_ehr
+        # print(context_seg_img_ehr.shape)
+        cls_output = self.fc(context_seg_img_ehr.flatten(start_dim=1))
+        return seg_out, cls_output
+
 
 if __name__ == "__main__":
-    net = UNETR(in_channels=1, out_channels=1, img_size=(48,48,48), feature_size=8, pos_embed='conv')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # from monai.networks.blocks import PatchEmbeddingBlock as PatchEmbeddingBlockOriginal
+    # net = PatchEmbeddingBlock(in_channels=1, img_size=48, patch_size=16, hidden_size=48, num_heads=12)
+    # net = DoubleFlow(in_channels=1, out_channels=1, img_size=(48, 48, 48), feature_size=16, pos_embed='conv', patch_size=16)
+    # net = UNETR(in_channels=1, out_channels=1, img_size=(48,48,48), feature_size=16, pos_embed='conv', patch_size=16)
     # net = ViT(in_channels=1, img_size=(48,48,48), patch_size=(8, 8, 8) ,pos_embed='conv')
     # net = PatchEmbeddingBlock(in_channels=1, img_size=48, patch_size=8, hidden_size=64, num_heads=4, pos_embed="conv")
-    img = torch.randn(1, 1, 48, 48, 48)
-    ehr = torch.randn(1, 15)
-    x = (img, ehr)
+    # net = CrossAttention(hidden_size=384)
+    # net = KSCNet(in_channels=1, out_channels=1, img_size=(48, 48, 48), feature_size=16, patch_size=16, hidden_size=384, num_heads=12)
+    net = ehr_net()
+    img = torch.randn(2, 1, 48, 48, 48)
+    ehr = torch.zeros(2, 15)
 
-    seg, cls = net(x)
-    # for layer in net.modules():
-    #     print(layer.shape)
-    print(seg.shape, cls)
+    # img = torch.randn(2, 216, 384)
+    # ehr = torch.zeros(2, 1, 384)
+    img = img.to(device)
+    ehr = ehr.to(device)
+    x = [img, ehr]
+    net.to(device)
+    # seg, cls = net(img, ehr)
+    out = net(ehr)
+    # print(seg.shape, cls.shape)
+    # seg = torch.sigmoid(seg)  # 将模型输出转换为概率值
+    # seg = (seg > 0.5).float()  # 应用阈值0.5进行二值化
+    print(out.shape, torch.unique(out))

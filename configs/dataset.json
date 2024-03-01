@@ -1,6 +1,6 @@
 {
   "data_dir": "/home/fanchenchenzc/datasets/data",
-  "infos_name": "bboxs_infos0125.json",
+  "infos_name": "clinical_infos_0220.json",
   "img_dir": "cropped_img",
   "mask_dir": "cropped_mask",
   "filter_volume": 0.006,

@@ -1,30 +1,20 @@
 # -*- coding: utf-8 -*-
-# Time    : 2023/10/30 20:35
-# Author  : fanc
-# File    : train_base.py
 
 import warnings
-
-import pandas as pd
 
 warnings.filterwarnings("ignore")
 import logging  # 引入logging模块
 import os.path
-import time
 import os
-import math
 import argparse
 
-import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
-import torch.optim.lr_scheduler as lr_scheduler
 from tqdm import tqdm
 import torch
-from torch.optim.lr_scheduler import ExponentialLR
 import torch.nn as nn
 from src.dataloader.load_data import split_data, my_dataloader
 from torch.nn.parallel import DataParallel
-from src.models.networks.resnet import generate_model
+from src.models.networks.nets import DoubleFlow, UNETR, KSCNet
 import time
 import json
 import torch.nn.functional as F
@@ -32,7 +22,8 @@ from utils import AverageMeter2 as AverageMeter
 from utils import calculate_acc_sigmoid
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, accuracy_score
 
-
+from monai.losses import DiceLoss
+from monai.metrics import DiceMetric
 def load_model(model, checkpoint_path, multi_gpu=False):
     """
     通用加载模型函数。
@@ -52,8 +43,12 @@ def load_model(model, checkpoint_path, multi_gpu=False):
     if list(state_dict.keys())[0].startswith('module.'):
         # 移除'module.'前缀（多卡到单卡）
         state_dict = {k[len("module."):]: v for k, v in state_dict.items()}
-    # 加载状态字典
-    model.load_state_dict(state_dict)
+    for name, param in model.named_parameters():
+        if name in state_dict and param.size() == state_dict[name].size():
+            param.data.copy_(state_dict[name])
+            # print(f"Loaded layer: {name}")
+        else:
+            print(f"Skipped layer: {name}")
     # 如果需要在多GPU上运行模型
     if multi_gpu:
         # 使用DataParallel封装模型
@@ -75,10 +70,19 @@ class Trainer:
         self.best_acc = 0
         self.best_acc_epoch = 0
         self.args = args
-        self.loss_function = torch.nn.BCEWithLogitsLoss()
+        self.BCELoss = torch.nn.BCELoss()
         self.summaryWriter = summaryWriter
-        self.use_clip = False
+        self.use_clip = args.clinical
+        self.dice_loss = DiceLoss(sigmoid=True)
+        self.dice_metric = DiceMetric(include_background=False, reduction="mean", get_not_nans=False)
         self.self_model()
+        # self.loss_weight = eval(args.loss_weight)# bec_weight, focal_weight, 1-sum() = dice_loss
+        self.loss_weight = [0.02, 0.18]
+
+        if not self.use_clip:
+            print("Not using clinical infos!")
+        else:
+            print("Using clinical infos!")
 
     def __call__(self):
         if self.args.phase == 'train':
@@ -92,6 +96,7 @@ class Trainer:
                 print("Epoch: {}, train time: {}".format(epoch, end - start))
                 if epoch % 1 == 0:
                     self.evaluate()
+            self.print_metrics(self.best_metrics, prefix='The Best metrics in epoch {}'.format(self.best_acc_epoch))
         else:
             self.evaluate()
 
@@ -103,15 +108,23 @@ class Trainer:
             print('load model weight success!')
         self.model.to(self.device)
 
-    def calculate_metrics(self, pred, label):
+    def calculate_metrics(self, pred, label, seg, mask):
         with torch.no_grad():
+            seg = torch.sigmoid(seg)  # 将模型输出转换为概率值
+            seg = (seg > 0.5).float()  # 应用阈值0.5进行二值化
+            self.dice_metric(seg, mask)
+            dice = self.dice_metric.aggregate().item()
+            # print("Unique values in prediction:", torch.unique(seg))
+            # print("Unique values in labels:", torch.unique(mask))
+            # print("seg shape: {}, mask shape: {}".format(seg.shape, mask.shape))
+            self.dice_metric.reset()
             pred = torch.sigmoid(pred)
             pred = (pred > 0.5).float()
             acc = accuracy_score(label, pred)
             precision = precision_score(label, pred)
             recall = recall_score(label, pred)
             f1 = f1_score(label, pred)
-            return acc, precision, recall, f1
+            return acc, precision, recall, f1, dice
     def calculate_all_metrics(self, pred, label):
         pred = torch.sigmoid(torch.tensor(pred))
         pred = (pred > 0.5).float()
@@ -121,11 +134,18 @@ class Trainer:
         f1 = f1_score(label, pred)
         auc = roc_auc_score(label, pred)
         return acc, precision, recall, f1, auc
+    def calculate_loss(self,pred, label, seg, mask):
+        dice_loss = self.dice_loss(seg, mask).mean()
+        BCE_loss = F.binary_cross_entropy_with_logits(pred, label).mean()
+        pt = torch.exp(-BCE_loss)
+        focal_loss = 0.25 * (1 - pt) ** 2.0 * BCE_loss
+        return BCE_loss, focal_loss, dice_loss
 
     def get_meters(self):
         meters = {
-            'loss': AverageMeter(),'accuracy': AverageMeter(), 'precision': AverageMeter(),
-            'recall': AverageMeter(),'f1': AverageMeter()
+            'loss': AverageMeter(), 'bce_loss': AverageMeter(), 'focal_loss': AverageMeter(), 'dice_loss': AverageMeter(),
+            'accuracy': AverageMeter(), 'precision': AverageMeter(), 'recall': AverageMeter(),
+            'f1': AverageMeter(), 'dice': AverageMeter()
         }
         return meters
     def update_meters(self, meters, values):
@@ -167,17 +187,23 @@ class Trainer:
         for inx, (img, mask, label, clinical) in tqdm(enumerate(self.train_loader), total=len(self.train_loader)):
             img, label, clinical, mask = img.to(self.device), label.to(self.device), clinical.to(self.device), mask.to(
                 self.device)
-            cls = self.model(img)[-1]
-            loss = self.loss_function(cls, label)
+            if not self.use_clip:
+                clinical = torch.zeros_like(clinical)
+            seg, cls = self.model(img, clinical)
+            bce_loss, focal_loss, dice_loss = self.calculate_loss(cls, label, seg, mask)
+            loss = self.loss_weight[0] * bce_loss + self.loss_weight[1] * focal_loss + (1-sum(self.loss_weight)) * dice_loss
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
             all_preds.extend(cls.detach().cpu().numpy())
             all_labels.extend(label.cpu().numpy())
-            acc, precision, recall, f1 = self.calculate_metrics(cls.cpu(), label.cpu())
+            acc, precision, recall, f1, dice = self.calculate_metrics(cls.cpu(), label.cpu(), seg.cpu(), mask.cpu())
             self.update_meters(
                 [meters[i] for i in meters.keys()],
-                [loss, acc, precision, recall, f1])
+                [loss, bce_loss, focal_loss, dice_loss, acc, precision, recall, f1, dice])
+
+            # if (inx + 1) % self.args.log_interval == 0:
+            #     self.print_metrics(meters, prefix=f'Epoch: [{self.epoch}][{inx + 1}/{len(self.train_loader)}]')
 
         meters['accuracy'], meters['precision'], meters['recall'], meters['f1'], meters['auc'] = self.calculate_all_metrics(all_preds, all_labels)
         self.print_metrics(meters, prefix=f'Epoch: [{self.epoch}]{len(self.train_loader)}]')
@@ -193,58 +219,64 @@ class Trainer:
             for inx, (img, mask, label, clinical) in tqdm(enumerate(self.test_loader), total=len(self.test_loader)):
                 img, label, clinical, mask = img.to(self.device), label.to(self.device), clinical.to(
                     self.device), mask.to(self.device)
-                cls = self.model(img)[-1]
-                # pred = torch.sigmoid(cls)
+                if not self.use_clip:
+                    clinical = torch.zeros_like(clinical)
 
-                loss_val = self.loss_function(cls, label)
-                # dice_loss_val = self.dice_loss(seg, mask)
-                # total_loss_val = self.loss_weight[0] * cls_loss_val + self.loss_weight[1] * dice_loss_val
-
-                all_preds.extend(cls.detach().cpu().numpy())
+                seg, cls = self.model(img, clinical)
+                bce_loss, focal_loss, dice_loss = self.calculate_loss(cls, label, seg, mask)
+                loss = self.loss_weight[0] * bce_loss + self.loss_weight[1] * focal_loss + (
+                            1 - sum(self.loss_weight)) * dice_loss
+                all_preds.extend(cls.cpu().numpy())
                 all_labels.extend(label.cpu().numpy())
-                acc, precision, recall, f1 = self.calculate_metrics(cls.cpu(), label.cpu())
+                acc, precision, recall, f1, dice = self.calculate_metrics(cls.cpu(), label.cpu(), seg.cpu(), mask.cpu())
                 self.update_meters(
                     [meters[i] for i in meters.keys()],
-                    [loss_val, acc, precision, recall, f1])
+                    [loss, bce_loss, focal_loss, dice_loss, acc, precision, recall, f1, dice])
 
-        meters['accuracy'], meters['precision'], meters['recall'], meters['f1'], meters['auc'] = self.calculate_all_metrics(all_preds, all_labels)
-        self.print_metrics(meters, prefix=f'Epoch-Val: [{self.epoch}]{len(self.train_loader)}]')
         # 更新学习率调度器
         self.scheduler.step(meters['loss'].avg)
+        meters['accuracy'], meters['precision'], meters['recall'], meters['f1'], meters[
+            'auc'] = self.calculate_all_metrics(all_preds, all_labels)
+        self.print_metrics(meters, prefix=f'Epoch-Val: [{self.epoch}]{len(self.train_loader)}]')
         # 记录性能指标到TensorBoard
         self.log_metrics_to_tensorboard(meters, self.epoch, stage_prefix='Val')
         print(f'Best acc is {self.best_acc} at epoch {self.best_acc_epoch}!')
         print(f'{self.best_acc}=>{meters["accuracy"]}')
 
-        # 检查并保存最佳模型
-        if meters['accuracy'] > self.best_acc:
-            self.best_acc_epoch = self.epoch
-            self.best_acc = meters['accuracy']
-            self.best_metrics = meters
-            with open(os.path.join(os.path.dirname(self.args.save_dir), 'best_acc_metrics.json'), 'w')as f:
-                json.dump({k: v for k, v in meters.items() if not isinstance(v, AverageMeter)}, f)
-            # 保存模型检查点
-            torch.save({
-                'epoch': self.epoch,
-                'model_state_dict': self.model.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'scheduler_state_dict': self.scheduler.state_dict(),
-                'best_acc': self.best_acc,
-            }, os.path.join(self.args.save_dir, 'best_checkpoint.pth'))
-            print(f"New best model saved at epoch {self.best_acc_epoch} with accuracy: {self.best_acc:.4f}")
-        self.print_metrics(meters, prefix=f'Epoch(Val): [{self.epoch}][{inx + 1}/{len(self.train_loader)}]')
+        # #auto loss weight
+        cls_loss_weight = meters['dice'].avg
+        self.loss_weight = [cls_loss_weight/10, cls_loss_weight - cls_loss_weight/10]
+        print(f'Loss weight: bce:{self.loss_weight[0]:.2f}, focal:{self.loss_weight[1]:.2f}, dice:{1-cls_loss_weight:.2f}')
 
-        if self.epoch % self.args.save_epoch == 0:
-            checkpoint = {
+        if self.args.phase == 'train':
+            # 检查并保存最佳模型
+            if meters['accuracy'] > self.best_acc:
+                self.best_acc_epoch = self.epoch
+                self.best_acc = meters['accuracy']
+                self.best_metrics = meters
+                with open(os.path.join(os.path.dirname(self.args.save_dir), 'best_acc_metrics.json'), 'w')as f:
+                    json.dump({k: v for k, v in meters.items() if not isinstance(v, AverageMeter)}, f)
+
+                torch.save({
                     'epoch': self.epoch,
-                    'model_state_dict': self.model.state_dict(),  # *模型参数
-                    'optimizer_state_dict': self.optimizer.state_dict(),  # *优化器参数
-                    'scheduler_state_dict': self.scheduler.state_dict(),  # *scheduler
-                    'best_acc': meters['accuracy'],
-                    'num_params': self.num_params
-                }
-            torch.save(checkpoint, os.path.join(self.args.save_dir, 'checkpoint-%d.pth' % self.epoch))
-            print(f"New checkpoint saved at epoch {self.epoch} with accuracy: {meters['accuracy']:.4f}")
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'scheduler_state_dict': self.scheduler.state_dict(),
+                    'best_acc': self.best_acc,
+                }, os.path.join(self.args.save_dir, 'best_checkpoint.pth'))
+                print(f"New best model saved at epoch {self.best_acc_epoch} with accuracy: {self.best_acc:.4f}")
+
+            if self.epoch % self.args.save_epoch == 0:
+                checkpoint = {
+                        'epoch': self.epoch,
+                        'model_state_dict': self.model.state_dict(),  # *模型参数
+                        'optimizer_state_dict': self.optimizer.state_dict(),  # *优化器参数
+                        'scheduler_state_dict': self.scheduler.state_dict(),  # *scheduler
+                        'best_acc': meters['accuracy'],
+                        'num_params': self.num_params
+                    }
+                torch.save(checkpoint, os.path.join(self.args.save_dir, 'checkpoint-%d.pth' % self.epoch))
+                print(f"New checkpoint saved at epoch {self.epoch} with accuracy: {meters['accuracy']:.4f}")
 
 def makedirs(path):
     if not os.path.exists(path):
@@ -256,19 +288,13 @@ def main(args, path):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("can use {} gpus".format(torch.cuda.device_count()))
     print(device)
-    model = generate_model(model_depth=args.rd, n_classes=args.num_classes, dropout_rate=args.dropout)
+    # model = generate_model(model_depth=args.rd, n_classes=args.num_classes, dropout_rate=args.dropout)
+    # model = UNETR(in_channels=1, out_channels=1, img_size=(48, 48, 48), feature_size=16, patch_size=16)
+    model = KSCNet(in_channels=1, out_channels=1, img_size=(48, 48, 48), feature_size=16, patch_size=16, hidden_size=384,
+           num_heads=12)
 
-    # dropout_rate = 0.8  # Dropout概率，一般设置在0.3到0.5之间
-    # num_features = model.fc.in_features
-    # model.fc = nn.Sequential(
-    #     nn.Dropout(dropout_rate),
-    #     nn.Linear(num_features, args.num_classes-1)  # num_classes为您的数据集类别数
-    # )
-
-    # if torch.cuda.device_count() > 1:
-    #     model = DataParallel(model)
-    # model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99))
+    # optimizer = torch.optim.Adam(model.fc.parameters(), lr=args.lr, weight_decay=0.01, betas=(0.9, 0.99))
     # scheduler = ExponentialLR(optimizer, gamma=0.99)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.1, patience=10, verbose=True)
 
@@ -315,21 +341,21 @@ def main(args, path):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--num-classes', type=int, default=2)
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch-size', type=int, default=1)
-    parser.add_argument('--lr', type=float, default=0.0001)
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--batch-size', type=int, default=2)
+    parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--weight_decay', type=float, default=0.001)
-    parser.add_argument('--rd', type=int, default=50)
+    parser.add_argument('--log_interval', type=int, default=1)
     parser.add_argument('--save-epoch', type=int, default=10)
     parser.add_argument('--num-workers', type=int, default=0)
-    parser.add_argument('--log_interval', type=int, default=1)
-    # parser.add_argument('--input-path', type=str, default='/home/wangchangmiao/kidney/data/')
+    parser.add_argument('--clinical', type=int, default=1)
     parser.add_argument('--MODEL-WEIGHT', type=str, default=None)
     parser.add_argument('--phase', type=str, default='train')
-    parser.add_argument('--dropout', type=float, default=0)
+    parser.add_argument('--loss_weight', type=str, default='[0.5, 0.5]')
 
     opt = parser.parse_args()
     args_dict = vars(opt)
+    args_dict['clinical'] = True if args_dict['clinical'] ==1 else False
     now = time.strftime('%y%m%d%H%M', time.localtime())
     path = None
     if opt.phase == 'train':

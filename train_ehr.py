@@ -1,37 +1,21 @@
 # -*- coding: utf-8 -*-
-# Time    : 2023/10/30 20:35
-# Author  : fanc
-# File    : train_base.py
 
 import warnings
-
-import pandas as pd
-
 warnings.filterwarnings("ignore")
-import logging  # 引入logging模块
 import os.path
-import time
 import os
-import math
 import argparse
-
-import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
-import torch.optim.lr_scheduler as lr_scheduler
 from tqdm import tqdm
 import torch
-from torch.optim.lr_scheduler import ExponentialLR
 import torch.nn as nn
 from src.dataloader.load_data import split_data, my_dataloader
-from torch.nn.parallel import DataParallel
-from src.models.networks.resnet import generate_model
 import time
 import json
-import torch.nn.functional as F
 from utils import AverageMeter2 as AverageMeter
 from utils import calculate_acc_sigmoid
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, accuracy_score
-
+from src.models.networks.nets import ehr_net
 
 def load_model(model, checkpoint_path, multi_gpu=False):
     """
@@ -71,11 +55,11 @@ class Trainer:
         self.test_loader = test_loader
         self.epochs = args.epochs
         self.epoch = 0
-        self.best_metrics = {}
         self.best_acc = 0
+        self.best_metrics = {}
         self.best_acc_epoch = 0
         self.args = args
-        self.loss_function = torch.nn.BCEWithLogitsLoss()
+        self.loss_function = torch.nn.BCEWithLogitsLoss()# torch.nn.BCELoss()
         self.summaryWriter = summaryWriter
         self.use_clip = False
         self.self_model()
@@ -92,6 +76,7 @@ class Trainer:
                 print("Epoch: {}, train time: {}".format(epoch, end - start))
                 if epoch % 1 == 0:
                     self.evaluate()
+            self.print_metrics(self.best_metrics, prefix='The Best metrics in epoch {}'.format(self.best_acc_epoch))
         else:
             self.evaluate()
 
@@ -128,6 +113,7 @@ class Trainer:
             'recall': AverageMeter(),'f1': AverageMeter()
         }
         return meters
+
     def update_meters(self, meters, values):
         for meter, value in zip(meters, values):
             meter.update(value)
@@ -167,7 +153,8 @@ class Trainer:
         for inx, (img, mask, label, clinical) in tqdm(enumerate(self.train_loader), total=len(self.train_loader)):
             img, label, clinical, mask = img.to(self.device), label.to(self.device), clinical.to(self.device), mask.to(
                 self.device)
-            cls = self.model(img)[-1]
+            cls = self.model(clinical)
+            # print(torch.unique(cls), torch.unique(label))
             loss = self.loss_function(cls, label)
             self.optimizer.zero_grad()
             loss.backward()
@@ -193,7 +180,7 @@ class Trainer:
             for inx, (img, mask, label, clinical) in tqdm(enumerate(self.test_loader), total=len(self.test_loader)):
                 img, label, clinical, mask = img.to(self.device), label.to(self.device), clinical.to(
                     self.device), mask.to(self.device)
-                cls = self.model(img)[-1]
+                cls = self.model(clinical)
                 # pred = torch.sigmoid(cls)
 
                 loss_val = self.loss_function(cls, label)
@@ -216,35 +203,36 @@ class Trainer:
         print(f'Best acc is {self.best_acc} at epoch {self.best_acc_epoch}!')
         print(f'{self.best_acc}=>{meters["accuracy"]}')
 
-        # 检查并保存最佳模型
-        if meters['accuracy'] > self.best_acc:
-            self.best_acc_epoch = self.epoch
-            self.best_acc = meters['accuracy']
-            self.best_metrics = meters
-            with open(os.path.join(os.path.dirname(self.args.save_dir), 'best_acc_metrics.json'), 'w')as f:
-                json.dump({k: v for k, v in meters.items() if not isinstance(v, AverageMeter)}, f)
-            # 保存模型检查点
-            torch.save({
-                'epoch': self.epoch,
-                'model_state_dict': self.model.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'scheduler_state_dict': self.scheduler.state_dict(),
-                'best_acc': self.best_acc,
-            }, os.path.join(self.args.save_dir, 'best_checkpoint.pth'))
-            print(f"New best model saved at epoch {self.best_acc_epoch} with accuracy: {self.best_acc:.4f}")
-        self.print_metrics(meters, prefix=f'Epoch(Val): [{self.epoch}][{inx + 1}/{len(self.train_loader)}]')
-
-        if self.epoch % self.args.save_epoch == 0:
-            checkpoint = {
+        if self.args.phase == 'train':
+            # 检查并保存最佳模型
+            if meters['accuracy'] > self.best_acc:
+                self.best_acc_epoch = self.epoch
+                self.best_acc = meters['accuracy']
+                self.best_metrics = meters
+                with open(os.path.join(os.path.dirname(self.args.save_dir), 'best_acc_metrics.json'), 'w')as f:
+                    json.dump({k: v for k, v in meters.items() if not isinstance(v, AverageMeter)}, f)
+                # 保存模型检查点
+                torch.save({
                     'epoch': self.epoch,
-                    'model_state_dict': self.model.state_dict(),  # *模型参数
-                    'optimizer_state_dict': self.optimizer.state_dict(),  # *优化器参数
-                    'scheduler_state_dict': self.scheduler.state_dict(),  # *scheduler
-                    'best_acc': meters['accuracy'],
-                    'num_params': self.num_params
-                }
-            torch.save(checkpoint, os.path.join(self.args.save_dir, 'checkpoint-%d.pth' % self.epoch))
-            print(f"New checkpoint saved at epoch {self.epoch} with accuracy: {meters['accuracy']:.4f}")
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'scheduler_state_dict': self.scheduler.state_dict(),
+                    'best_acc': self.best_acc,
+                }, os.path.join(self.args.save_dir, 'best_checkpoint.pth'))
+                print(f"New best model saved at epoch {self.best_acc_epoch} with accuracy: {self.best_acc:.4f}")
+            self.print_metrics(meters, prefix=f'Epoch(Val): [{self.epoch}][{inx + 1}/{len(self.train_loader)}]')
+
+            if self.epoch % self.args.save_epoch == 0:
+                checkpoint = {
+                        'epoch': self.epoch,
+                        'model_state_dict': self.model.state_dict(),  # *模型参数
+                        'optimizer_state_dict': self.optimizer.state_dict(),  # *优化器参数
+                        'scheduler_state_dict': self.scheduler.state_dict(),  # *scheduler
+                        'best_acc': meters['accuracy'],
+                        'num_params': self.num_params
+                    }
+                torch.save(checkpoint, os.path.join(self.args.save_dir, 'checkpoint-%d.pth' % self.epoch))
+                print(f"New checkpoint saved at epoch {self.epoch} with accuracy: {meters['accuracy']:.4f}")
 
 def makedirs(path):
     if not os.path.exists(path):
@@ -254,20 +242,13 @@ def makedirs(path):
 def main(args, path):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cpu')
     print("can use {} gpus".format(torch.cuda.device_count()))
     print(device)
-    model = generate_model(model_depth=args.rd, n_classes=args.num_classes, dropout_rate=args.dropout)
+    # model = generate_model(model_depth=args.rd, n_classes=args.num_classes, dropout_rate=args.dropout)
+    model = ehr_net()
 
-    # dropout_rate = 0.8  # Dropout概率，一般设置在0.3到0.5之间
-    # num_features = model.fc.in_features
-    # model.fc = nn.Sequential(
-    #     nn.Dropout(dropout_rate),
-    #     nn.Linear(num_features, args.num_classes-1)  # num_classes为您的数据集类别数
-    # )
 
-    # if torch.cuda.device_count() > 1:
-    #     model = DataParallel(model)
-    # model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99))
     # scheduler = ExponentialLR(optimizer, gamma=0.99)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.1, patience=10, verbose=True)
@@ -319,14 +300,12 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=1)
     parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--weight_decay', type=float, default=0.001)
-    parser.add_argument('--rd', type=int, default=50)
     parser.add_argument('--save-epoch', type=int, default=10)
     parser.add_argument('--num-workers', type=int, default=0)
     parser.add_argument('--log_interval', type=int, default=1)
-    # parser.add_argument('--input-path', type=str, default='/home/wangchangmiao/kidney/data/')
     parser.add_argument('--MODEL-WEIGHT', type=str, default=None)
     parser.add_argument('--phase', type=str, default='train')
-    parser.add_argument('--dropout', type=float, default=0)
+
 
     opt = parser.parse_args()
     args_dict = vars(opt)

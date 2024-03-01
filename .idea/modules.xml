@@ -3,6 +3,7 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/.idea/KidneyStoneClassification-main.iml" filepath="$PROJECT_DIR$/.idea/KidneyStoneClassification-main.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../tmss_miccai/.idea/tmss_miccai.iml" filepath="$PROJECT_DIR$/../tmss_miccai/.idea/tmss_miccai.iml" />
     </modules>
   </component>
 </project>

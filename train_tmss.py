@@ -24,7 +24,7 @@ from torch.optim.lr_scheduler import ExponentialLR
 import torch.nn as nn
 from src.dataloader.load_data import split_data, my_dataloader
 from torch.nn.parallel import DataParallel
-from src.models.networks.nets import UNETR
+from src.models.networks.nets import DoubleFlow, UNETR
 import time
 import json
 import torch.nn.functional as F
@@ -102,11 +102,16 @@ class Trainer:
         self.args = args
         self.loss_function = torch.nn.BCELoss()
         self.summaryWriter = summaryWriter
-        self.use_clip = False
+        self.use_clip = args.clinical
         self.dice_loss = DiceLoss(sigmoid=True)
         self.dice_metric = DiceMetric(include_background=False, reduction="mean", get_not_nans=False)
         self.self_model()
         self.loss_weight = eval(args.loss_weight)
+
+        if not self.use_clip:
+            print("Not using clinical infos!")
+        else:
+            print("Using clinical infos!")
 
     def __call__(self):
         if self.args.phase == 'train':
@@ -189,6 +194,8 @@ class Trainer:
         for inx, (img, mask, label, clinical) in tqdm(enumerate(self.train_loader), total=len(self.train_loader)):
             img, label, clinical, mask = img.to(self.device), label.to(self.device), clinical.to(self.device), mask.to(
                 self.device)
+            if not self.use_clip:
+                clinical = torch.zeros_like(clinical)
             seg, cls = self.model([img, clinical])
             pred = torch.sigmoid(cls)
             cls_loss = self.loss_function(pred, label)
@@ -228,6 +235,9 @@ class Trainer:
             for inx, (img, mask, label, clinical) in tqdm(enumerate(self.test_loader), total=len(self.test_loader)):
                 img, label, clinical, mask = img.to(self.device), label.to(self.device), clinical.to(
                     self.device), mask.to(self.device)
+                if not self.use_clip:
+                    clinical = torch.zeros_like(clinical)
+
                 seg, cls = self.model([img, clinical])
                 pred = torch.sigmoid(cls)
 
@@ -290,7 +300,9 @@ def main(args, path):
     print("can use {} gpus".format(torch.cuda.device_count()))
     print(device)
     # model = generate_model(model_depth=args.rd, n_classes=args.num_classes, dropout_rate=args.dropout)
-    model = UNETR(in_channels=1, out_channels=1, img_size=(48, 48, 48), feature_size=8, pos_embed='conv')
+    # model = UNETR(in_channels=1, out_channels=1, img_size=(48, 48, 48), feature_size=16, patch_size=16)
+    model = DoubleFlow(in_channels=1, out_channels=1, img_size=(48, 48, 48), feature_size=16, patch_size=16)
+
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99))
     # optimizer = torch.optim.Adam(model.fc.parameters(), lr=args.lr, weight_decay=0.01, betas=(0.9, 0.99))
@@ -301,13 +313,13 @@ def main(args, path):
     with open('configs/dataset.json', 'r', encoding='utf-8') as f:
         dataset = json.load(f)
     data_dir = dataset['data_dir']
-    # infos_name = dataset['infos_name']
-    # filter_volume = dataset['filter_volume']
-    # train_info, val_info = split_data(data_dir, infos_name, filter_volume, rate=0.8)
-    with open(os.path.join(data_dir, 'train_clinical_infos.json'), 'r', encoding='utf-8') as f:
-        train_info = json.load(f)
-    with open(os.path.join(data_dir, 'val_clinical_infos.json'), 'r', encoding='utf-8') as f:
-        val_info = json.load(f)
+    infos_name = dataset['infos_name']
+    filter_volume = dataset['filter_volume']
+    train_info, val_info = split_data(data_dir, infos_name, filter_volume, rate=0.8)
+    # with open(os.path.join(data_dir, 'train_clinical_infos.json'), 'r', encoding='utf-8') as f:
+    #     train_info = json.load(f)
+    # with open(os.path.join(data_dir, 'val_clinical_infos.json'), 'r', encoding='utf-8') as f:
+    #     val_info = json.load(f)
     train_loader = my_dataloader(data_dir,
                                       train_info,
                                       batch_size=args.batch_size,
@@ -341,19 +353,20 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--num-classes', type=int, default=2)
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--batch-size', type=int, default=1)
+    parser.add_argument('--batch-size', type=int, default=2)
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--weight_decay', type=float, default=0.001)
     parser.add_argument('--log_interval', type=int, default=1)
     parser.add_argument('--save-epoch', type=int, default=10)
     parser.add_argument('--num-workers', type=int, default=0)
-    parser.add_argument('--clinical', type=bool, default=True)
+    parser.add_argument('--clinical', type=int, default=1)
     parser.add_argument('--MODEL-WEIGHT', type=str, default=None)
     parser.add_argument('--phase', type=str, default='train')
     parser.add_argument('--loss_weight', type=str, default='[0.5, 0.5]')
 
     opt = parser.parse_args()
     args_dict = vars(opt)
+    args_dict['clinical'] = True if args_dict['clinical'] ==1 else False
     now = time.strftime('%y%m%d%H%M', time.localtime())
     path = None
     if opt.phase == 'train':
