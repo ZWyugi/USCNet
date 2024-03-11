@@ -24,6 +24,8 @@ from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_sco
 
 from monai.losses import DiceLoss
 from monai.metrics import DiceMetric
+import SimpleITK as sitk
+import numpy as np
 def load_model(model, checkpoint_path, multi_gpu=False):
     """
     通用加载模型函数。
@@ -56,6 +58,25 @@ def load_model(model, checkpoint_path, multi_gpu=False):
 
     return model
 
+def save_seg_result(seg_results, seg_result_path, data_infos):
+    # seg_result = seg_result.cpu().numpy()
+    for idx, seg_result in enumerate(seg_results):
+        # print(seg_result.shape)
+        seg_result = (seg_result > 0.5).astype(float)
+        # 构建每个分割结果的保存路
+        sid = data_infos[idx]['sid']
+        save_name = os.path.join(seg_result_path, 'seg_inference_ours', f"{sid}.nii")
+        original_image = sitk.ReadImage(f'../../datasets/data/cropped_mask/{sid}.nii.gz')
+        original_origin = original_image.GetOrigin()
+        original_spacing = original_image.GetSpacing()
+        original_direction = original_image.GetDirection()
+        # 保存分割结果
+        seg_result_itk = sitk.GetImageFromArray(seg_result[0])
+        seg_result_itk.SetOrigin(original_origin)
+        seg_result_itk.SetSpacing(original_spacing)
+        seg_result_itk.SetDirection(original_direction)
+        sitk.WriteImage(seg_result_itk, save_name)
+
 class Trainer:
     def __init__(self, model, optimizer, device, train_loader, test_loader, scheduler, args, summaryWriter):
         self.model = model
@@ -76,8 +97,8 @@ class Trainer:
         self.dice_loss = DiceLoss(sigmoid=True)
         self.dice_metric = DiceMetric(include_background=False, reduction="mean", get_not_nans=False)
         self.self_model()
-        # self.loss_weight = eval(args.loss_weight)# bec_weight, focal_weight, 1-sum() = dice_loss
-        self.loss_weight = [0.02, 0.18]
+        self.loss_weight = eval(args.loss_weight)# bec_weight, focal_weight, 1-sum() = dice_loss
+        # self.loss_weight = [0.02, 0.18]
 
         if not self.use_clip:
             print("Not using clinical infos!")
@@ -99,6 +120,7 @@ class Trainer:
             self.print_metrics(self.best_metrics, prefix='The Best metrics in epoch {}'.format(self.best_acc_epoch))
         else:
             self.evaluate()
+
 
     def self_model(self):
         if self.args.MODEL_WEIGHT:
@@ -206,7 +228,7 @@ class Trainer:
             #     self.print_metrics(meters, prefix=f'Epoch: [{self.epoch}][{inx + 1}/{len(self.train_loader)}]')
 
         meters['accuracy'], meters['precision'], meters['recall'], meters['f1'], meters['auc'] = self.calculate_all_metrics(all_preds, all_labels)
-        self.print_metrics(meters, prefix=f'Epoch: [{self.epoch}]{len(self.train_loader)}]')
+        self.print_metrics(meters, prefix=f'Epoch: [{self.epoch}/{self.epochs}]')
         self.log_metrics_to_tensorboard(meters, self.epoch, stage_prefix='Train')
         self.log_metrics_to_tensorboard({'lr':self.optimizer.param_groups[0]['lr']}, self.epoch)
 
@@ -215,6 +237,7 @@ class Trainer:
         meters = self.get_meters()
         all_preds = []
         all_labels = []
+        all_segs = []
         with torch.no_grad():  # 禁用梯度计算
             for inx, (img, mask, label, clinical) in tqdm(enumerate(self.test_loader), total=len(self.test_loader)):
                 img, label, clinical, mask = img.to(self.device), label.to(self.device), clinical.to(
@@ -228,25 +251,31 @@ class Trainer:
                             1 - sum(self.loss_weight)) * dice_loss
                 all_preds.extend(cls.cpu().numpy())
                 all_labels.extend(label.cpu().numpy())
+                if self.args.phase != 'train':
+                    all_segs.extend(seg.cpu().numpy())
+
                 acc, precision, recall, f1, dice = self.calculate_metrics(cls.cpu(), label.cpu(), seg.cpu(), mask.cpu())
                 self.update_meters(
                     [meters[i] for i in meters.keys()],
                     [loss, bce_loss, focal_loss, dice_loss, acc, precision, recall, f1, dice])
 
-        # 更新学习率调度器
-        self.scheduler.step(meters['loss'].avg)
         meters['accuracy'], meters['precision'], meters['recall'], meters['f1'], meters[
             'auc'] = self.calculate_all_metrics(all_preds, all_labels)
-        self.print_metrics(meters, prefix=f'Epoch-Val: [{self.epoch}]{len(self.train_loader)}]')
+        self.print_metrics(meters, prefix=f'Epoch-Val: [{self.epoch}/{self.epochs}]')
+        if self.args.phase != 'train':
+            save_seg_result(all_segs, self.args.inference_path, self.args.val_infos)
+            return
+        # 更新学习率调度器
+        self.scheduler.step(meters['loss'].avg)
         # 记录性能指标到TensorBoard
         self.log_metrics_to_tensorboard(meters, self.epoch, stage_prefix='Val')
         print(f'Best acc is {self.best_acc} at epoch {self.best_acc_epoch}!')
         print(f'{self.best_acc}=>{meters["accuracy"]}')
 
         # #auto loss weight
-        cls_loss_weight = meters['dice'].avg
-        self.loss_weight = [cls_loss_weight/10, cls_loss_weight - cls_loss_weight/10]
-        print(f'Loss weight: bce:{self.loss_weight[0]:.2f}, focal:{self.loss_weight[1]:.2f}, dice:{1-cls_loss_weight:.2f}')
+        # cls_loss_weight = meters['dice'].avg
+        # self.loss_weight = [cls_loss_weight/10, cls_loss_weight - cls_loss_weight/10]
+        # print(f'Loss weight: bce:{self.loss_weight[0]:.2f}, focal:{self.loss_weight[1]:.2f}, dice:{1-cls_loss_weight:.2f}')
 
         if self.args.phase == 'train':
             # 检查并保存最佳模型
@@ -326,7 +355,11 @@ def main(args, path):
         model_path = makedirs(os.path.join(path, 'models'))
         args.log_dir = log_path
         args.save_dir = model_path
+
         summaryWriter = SummaryWriter(log_dir=args.log_dir)
+    else:
+        args.val_infos = val_info
+
     trainer = Trainer(model,
                       optimizer,
                       device,
@@ -350,6 +383,7 @@ if __name__ == '__main__':
     parser.add_argument('--num-workers', type=int, default=0)
     parser.add_argument('--clinical', type=int, default=1)
     parser.add_argument('--MODEL-WEIGHT', type=str, default=None)
+    parser.add_argument('--inference_path', type=str, default='')
     parser.add_argument('--phase', type=str, default='train')
     parser.add_argument('--loss_weight', type=str, default='[0.5, 0.5]')
 

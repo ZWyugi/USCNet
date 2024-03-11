@@ -985,14 +985,20 @@ class KSCNet(nn.Module):
 
         dec4 = self.proj_feat(_, self.hidden_size, self.feat_size)
         dec3 = self.decoder5(dec4, enc4)
+
+
         dec2 = self.decoder4(dec3, enc3)
         dec1 = self.decoder3(dec2, enc2)
 
         dec0 = self.decoder2(dec1, enc1)
         seg_out = self.out(dec0)
         z12_mean = torch.mean(hidden_states_out[-1], dim=1).unsqueeze(dim=1)
+        # print(context_img_ehr.shape)
+
         # seg-attention
-        context_seg_img_ehr = self.cross_attention(q=z12_mean, k=context_img_ehr, v=context_img_ehr)
+        context_seg_img_ehr = z12_mean #no clinical
+        # context_seg_img_ehr = context_img_ehr # drop SMA
+        # context_seg_img_ehr = self.cross_attention(q=z12_mean, k=context_img_ehr, v=context_img_ehr)
         # context_seg_img_ehr = torch.mean(context_seg_img_ehr, dim=1)
         # print(z12_mean.shape, z12_mean.flatten(start_dim=1).shape, context_img_ehr.shape)
 
@@ -1012,8 +1018,8 @@ if __name__ == "__main__":
     # net = ViT(in_channels=1, img_size=(48,48,48), patch_size=(8, 8, 8) ,pos_embed='conv')
     # net = PatchEmbeddingBlock(in_channels=1, img_size=48, patch_size=8, hidden_size=64, num_heads=4, pos_embed="conv")
     # net = CrossAttention(hidden_size=384)
-    # net = KSCNet(in_channels=1, out_channels=1, img_size=(48, 48, 48), feature_size=16, patch_size=16, hidden_size=384, num_heads=12)
-    net = ehr_net()
+    net = KSCNet(in_channels=1, out_channels=1, img_size=(48, 48, 48), feature_size=16, patch_size=16, hidden_size=384, num_heads=12)
+    # net = ehr_net()
     img = torch.randn(2, 1, 48, 48, 48)
     ehr = torch.zeros(2, 15)
 
@@ -1023,9 +1029,9 @@ if __name__ == "__main__":
     ehr = ehr.to(device)
     x = [img, ehr]
     net.to(device)
-    # seg, cls = net(img, ehr)
-    out = net(ehr)
-    # print(seg.shape, cls.shape)
+    seg, cls = net(img, ehr)
+    # out = net(ehr)
+    print(seg.shape, cls.shape)
     # seg = torch.sigmoid(seg)  # 将模型输出转换为概率值
     # seg = (seg > 0.5).float()  # 应用阈值0.5进行二值化
-    print(out.shape, torch.unique(out))
+    # print(out.shape, torch.unique(out))

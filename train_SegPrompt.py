@@ -26,6 +26,7 @@ from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_sco
 
 from monai.losses import DiceLoss
 from monai.metrics import DiceMetric
+import SimpleITK as sitk
 def load_model(model, checkpoint_path, multi_gpu=False):
     """
     通用加载模型函数。
@@ -57,6 +58,25 @@ def load_model(model, checkpoint_path, multi_gpu=False):
         model = nn.DataParallel(model)
 
     return model
+
+def save_seg_result(seg_results, seg_result_path, data_infos):
+    # seg_result = seg_result.cpu().numpy()
+    for idx, seg_result in enumerate(seg_results):
+        # print(seg_result.shape)
+        seg_result = (seg_result > 0.5).astype(float)
+        # 构建每个分割结果的保存路
+        sid = data_infos[idx]['sid']
+        save_name = os.path.join(seg_result_path, 'seg_inference', f"{sid}.nii")
+        original_image = sitk.ReadImage(f'../../datasets/data/cropped_mask/{sid}.nii.gz')
+        original_origin = original_image.GetOrigin()
+        original_spacing = original_image.GetSpacing()
+        original_direction = original_image.GetDirection()
+        # 保存分割结果
+        seg_result_itk = sitk.GetImageFromArray(seg_result[0])
+        seg_result_itk.SetOrigin(original_origin)
+        seg_result_itk.SetSpacing(original_spacing)
+        seg_result_itk.SetDirection(original_direction)
+        sitk.WriteImage(seg_result_itk, save_name)
 
 class TrainerSeg:
     def __init__(self, model, optimizer, device, train_loader, test_loader, scheduler, args, summaryWriter):
@@ -184,14 +204,14 @@ class TrainerSeg:
                 [meters[i] for i in meters.keys()],
                 [loss, dice])
 
-        self.print_metrics(meters, prefix=f'Epoch: [{self.epoch}]{len(self.train_loader)}]')
+        self.print_metrics(meters, prefix=f'Epoch: [{self.epoch}/{self.epochs}]')
         self.log_metrics_to_tensorboard(meters, self.epoch, stage_prefix='Train')
         self.log_metrics_to_tensorboard({'lr':self.optimizer.param_groups[0]['lr']}, self.epoch)
 
     def evaluate(self):
         self.model.eval()  # 切换模型到评估模式
         meters = self.get_meters()
-
+        all_segs = []
         with torch.no_grad():  # 禁用梯度计算
             for inx, (img, mask, label, clinical) in tqdm(enumerate(self.test_loader), total=len(self.test_loader)):
                 img, label, clinical, mask = img.to(self.device), label.to(self.device), clinical.to(
@@ -205,10 +225,15 @@ class TrainerSeg:
                 self.update_meters(
                     [meters[i] for i in meters.keys()],
                     [loss, dice])
+                if self.args.phase != 'train':
+                    all_segs.extend(seg.cpu().numpy())
 
+        self.print_metrics(meters, prefix=f'Epoch-Val: [{self.epoch}/{self.epochs}]')
+        if self.args.phase != 'train':
+            save_seg_result(all_segs, self.args.inference_path, self.args.val_infos)
+            return
         # 更新学习率调度器
         self.scheduler.step(meters['loss'].avg)
-        self.print_metrics(meters, prefix=f'Epoch-Val: [{self.epoch}]{len(self.train_loader)}]')
         # 记录性能指标到TensorBoard
         self.log_metrics_to_tensorboard(meters, self.epoch, stage_prefix='Val')
         print(f'{self.best_dice}=>{meters["dice"].avg}')
@@ -298,14 +323,6 @@ class Trainer:
 
     def calculate_metrics(self, pred, label):
         with torch.no_grad():
-            # seg = torch.sigmoid(seg)  # 将模型输出转换为概率值
-            # seg = (seg > 0.5).float()  # 应用阈值0.5进行二值化
-            # self.dice_metric(seg, mask)
-            # dice = self.dice_metric.aggregate().item()
-            # print("Unique values in prediction:", torch.unique(seg))
-            # print("Unique values in labels:", torch.unique(mask))
-            # print("seg shape: {}, mask shape: {}".format(seg.shape, mask.shape))
-            # self.dice_metric.reset()
             pred = torch.sigmoid(pred)
             pred = (pred > 0.5).float()
             acc = accuracy_score(label, pred)
@@ -393,7 +410,7 @@ class Trainer:
             #     self.print_metrics(meters, prefix=f'Epoch: [{self.epoch}][{inx + 1}/{len(self.train_loader)}]')
 
         meters['accuracy'], meters['precision'], meters['recall'], meters['f1'], meters['auc'] = self.calculate_all_metrics(all_preds, all_labels)
-        self.print_metrics(meters, prefix=f'Epoch: [{self.epoch}]{len(self.train_loader)}]')
+        self.print_metrics(meters, prefix=f'Epoch: [{self.epoch}/{self.epochs}]')
         self.log_metrics_to_tensorboard(meters, self.epoch, stage_prefix='Train')
         self.log_metrics_to_tensorboard({'lr':self.optimizer.param_groups[0]['lr']}, self.epoch)
 
@@ -423,7 +440,7 @@ class Trainer:
         self.scheduler.step(meters['loss'].avg)
         meters['accuracy'], meters['precision'], meters['recall'], meters['f1'], meters[
             'auc'] = self.calculate_all_metrics(all_preds, all_labels)
-        self.print_metrics(meters, prefix=f'Epoch-Val: [{self.epoch}]{len(self.train_loader)}]')
+        self.print_metrics(meters, prefix=f'Epoch-Val: [{self.epoch}/{self.epochs}]')
         # 记录性能指标到TensorBoard
         self.log_metrics_to_tensorboard(meters, self.epoch, stage_prefix='Val')
         print(f'Best acc is {self.best_acc} at epoch {self.best_acc_epoch}!')
@@ -474,8 +491,8 @@ def main(args, path):
     # model = generate_model(model_depth=args.rd, n_classes=args.num_classes, dropout_rate=args.dropout)
     # model = UNETR(in_channels=1, out_channels=1, img_size=(48, 48, 48), feature_size=16, patch_size=16)
     # model = KSCNet(in_channels=1, out_channels=1, img_size=(48, 48, 48), feature_size=16, patch_size=16, hidden_size=384, num_heads=12)
-    # model = UNet3D(in_channels=1, out_channels=1)
-    model = SegPromptBackbone(in_channels=1, out_channels=1, img_size=48)
+    model = UNet3D(in_channels=1, out_channels=1)
+    # model = SegPromptBackbone(in_channels=1, out_channels=1, img_size=48)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99))
     # optimizer = torch.optim.Adam(model.fc.parameters(), lr=args.lr, weight_decay=0.01, betas=(0.9, 0.99))
@@ -511,7 +528,9 @@ def main(args, path):
         args.log_dir = log_path
         args.save_dir = model_path
         summaryWriter = SummaryWriter(log_dir=args.log_dir)
-    trainer = Trainer(model,
+    else:
+        args.val_infos = val_info
+    trainer = TrainerSeg(model,
                       optimizer,
                       device,
                       train_loader,
@@ -534,6 +553,7 @@ if __name__ == '__main__':
     parser.add_argument('--MODEL-WEIGHT', type=str, default=None)
     parser.add_argument('--phase', type=str, default='train')
     parser.add_argument('--loss_weight', type=str, default='[0.5, 0.5]')
+    parser.add_argument('--inference_path', type=str, default='')
 
     opt = parser.parse_args()
     args_dict = vars(opt)
